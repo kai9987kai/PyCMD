@@ -1,14 +1,16 @@
 from subprocess import call
 import os
+print("""
+This is a CMD EMULATOR\n    For best functionality use this on the Python Command Line
+To change directory you will need to type CWD, then once prompted type the directory path. Use Forward Slashes
+Default drive will be the one you launch the script in.
+Some commands have benn adapted for easier use, but still give the same output.
+For help type _HELP
+Or my GitHub http://www.github.com/Jared-dareJ/
+Example\n  CWD /Users/Jared/PycharmProjects
+        By Jared (C)03/2019
+""")
 
-print("This is a CMD EMULATOR\n    For best functionality use this on the Python Command Line")
-print("To change directory you will need to type CWD, then once prompted type the directory path. Use Forward Slashes")
-print("Default drive will be the one you launch the script in.")
-print("Some commands have benn adapted for easier use, but still give the same output.")
-print("For help type _HELP")
-print("Or my GitHub http://www.github.com/Jared-dareJ/")
-print("Example\n  CWD /Users/Jared/PycharmProjects")
-print("        By Jared (C)03/2019")
 
 def cls():
     call('cls', shell=True)
