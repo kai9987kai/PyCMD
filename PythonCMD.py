@@ -2,12 +2,14 @@
 """
 Advanced CMD Emulator for Windows [Version 3.0 - Enhanced 2026]
 By Jared (C)03/2019 - Enhanced 2026
+Contribution credits
+kai9987kai
 
-PyCMD keeps the original simple command surface and adds practical shell
+PyCMD keeps the original simple command surface and adds a practical shell
 quality-of-life features: better command discovery, optional persistent
 aliases, directory bookmarks, command suggestions, and lightweight stats.
 
-For best functionality run this on the Python command line.
+For best functionality, run this on the Python command line.
 Visit my GitHub: http://www.github.com/Jared-dareJ/
 """
 
