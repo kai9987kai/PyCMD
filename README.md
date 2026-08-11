@@ -136,13 +136,36 @@ Because the record file captures everything you type, treat it as sensitive.
 Turn it off with `RECORD off`, and delete it with `HISTORY --purge`.
 `HISTORY --clear` only clears the in-memory session list and says so.
 
+## Behaviour changes from 3.0
+
+Besides the execution policy above:
+
+- `MKDIR a b` creates **two** directories, and `DEL a b` deletes two, matching
+  `cmd.exe`. Quote a name that contains spaces: `MKDIR "my folder"`.
+- `DEL` expands wildcards itself and asks before removing more than one file.
+  Use `--force` to skip the prompt and `--dry-run` to see the list first.
+- Alias, macro and bookmark names cannot contain whitespace, quotes or operator
+  characters, and cannot shadow a builtin. Existing entries that break these
+  rules are ignored with a warning but are **kept** in the config file.
+- `HISTORY 0` and other useless limits are rejected instead of printing
+  everything.
+- A macro argument containing `;`, `|`, `&`, `<` or `>` is quoted when it is
+  substituted, so it can no longer inject a second command into the macro.
+
 ## Notes and limitations
 
 - Redirected output is written as UTF-8, not the console code page.
-- Builtins do not read piped input; a pipe feeds the next *program*, so
-  `DIR | findstr x` works and `DIR | ECHO x` discards the input.
-- `!` and `LEGACY` pass their tail to the OS shell verbatim, so operators and
-  redirection in those lines are the shell's to interpret, not PyCMD's.
+- Builtins do not read piped input or `<` redirection; a pipe feeds the next
+  *program*, so `DIR | findstr x` works and `DIR | ECHO x` discards the input.
+- `!`, `LEGACY` and `RUN` pass their tail to the OS shell verbatim, so
+  operators and redirection in those lines are the shell's to interpret, not
+  PyCMD's. `ALIAS`, `MACRO` and `EXPLAIN` likewise keep their tail intact.
+- A line containing an unpaired quote (`ECHO don't stop`) is treated literally
+  rather than refused, so operators and redirection are not detected in it.
+- Two PyCMD sessions writing config at the same time still last-writer-wins;
+  there is no file locking.
+- `CLS` and `COLOR` act on the console only, so they decline to run when output
+  is redirected or piped.
 - On Windows, stock CPython has no `readline`, so tab completion and line
   editing are unavailable until you `pip install pyreadline3`. PyCMD itself
   needs nothing installed; it reports the backend in `CONFIG`.

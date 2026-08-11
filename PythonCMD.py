@@ -51,7 +51,12 @@ RECORD_WINDOW_BYTES = 256 * 1024
 READLINE_HISTORY_LENGTH = 2000
 
 SCRIPT_PATH = os.path.abspath(sys.argv[0])
-LAUNCH_ARGV = list(sys.argv[1:])
+# RESTART re-execs in whatever directory the user has since cd'd into, so any
+# relative path on the original command line has to be pinned down now.
+LAUNCH_ARGV = [
+    os.path.abspath(argument) if os.path.exists(argument) else argument
+    for argument in sys.argv[1:]
+]
 
 DEFAULT_POLICY = {
     "shell_fallback": "confirm",
@@ -155,7 +160,13 @@ class CMDEmulator:
         self.aliases = {}
         self.macros = {}
         self.bookmarks = {}
+        # self.policy is what this session enforces; self.stored_policy is what
+        # gets written back. A transient CLI override (--safe-mode, one-shot
+        # lockdown) changes only the former, so running `pycmd --safe-mode -c
+        # "ALIAS ..."` once cannot silently lock down every later session.
         self.policy = dict(DEFAULT_POLICY)
+        self.stored_policy = dict(DEFAULT_POLICY)
+        self.quarantined = {}
         self.command_stats = collections.deque(maxlen=200)
         self.history_file = history_file
         self.config_file = config_file
@@ -278,22 +289,41 @@ class CMDEmulator:
         """True when normal output is going somewhere other than the console."""
         return self._stdout is not None
 
+    @property
+    def redirected(self):
+        """True when either stream is diverted.
+
+        External programs inherit real OS handles, so they must take the
+        capturing path whenever *any* stream has been redirected. Testing only
+        stdout would open (and truncate) the target of a bare `2>` and then let
+        the child write past it to the console.
+        """
+        return self._stdout is not None or self._stderr is not None
+
     def emit(self, *values, **kwargs):
         separator = kwargs.pop("sep", " ")
         end = kwargs.pop("end", "\n")
         if kwargs:
             raise TypeError("emit() got unexpected keyword arguments: %s" % sorted(kwargs))
-        text = separator.join(str(value) for value in values) + end
-        try:
-            self.out.write(text)
-        except (BrokenPipeError, ValueError):
-            pass
+        self.write_to(self.out, separator.join(str(value) for value in values) + end)
 
     def emit_error(self, *values):
-        text = " ".join(str(value) for value in values) + "\n"
+        self.write_to(self.err, " ".join(str(value) for value in values) + "\n")
+
+    @staticmethod
+    def write_to(stream, text):
+        """Write text, degrading rather than dropping it.
+
+        A console code page that cannot represent a character raises
+        UnicodeEncodeError; swallowing that would silently delete whole lines of
+        a DIR listing, so transliterate instead. Only a closed pipe is ignored.
+        """
         try:
-            self.err.write(text)
-        except (BrokenPipeError, ValueError):
+            stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            stream.write(text.encode(encoding, "backslashreplace").decode(encoding, "replace"))
+        except BrokenPipeError:
             pass
 
     def ask(self, question):
@@ -432,6 +462,7 @@ class CMDEmulator:
                 if key in DEFAULT_POLICY:
                     self.policy[key] = value
         self.normalise_policy()
+        self.stored_policy = dict(self.policy)
         self.rebuild_indexes()
 
     def load_name_map(self, raw, kind):
@@ -439,13 +470,19 @@ class CMDEmulator:
         if not isinstance(raw, dict):
             return {}
         cleaned = {}
+        # Entries this session refuses are kept aside and written back on save.
+        # Ignoring an entry is fine; deleting the user's definition is not.
+        quarantine = self.quarantined.setdefault(kind, {})
         for name, value in raw.items():
             if not isinstance(name, str) or not isinstance(value, str):
                 self.emit_error("Warning: ignoring non-text %s entry: %r" % (kind, name))
                 continue
             ok, reason = self.validate_name(name, kind)
             if not ok:
-                self.emit_error("Warning: ignoring %s '%s': %s" % (kind, name, reason))
+                quarantine[name] = value
+                self.emit_error(
+                    "Warning: ignoring %s '%s': %s (kept in the config, unused)" % (kind, name, reason)
+                )
                 continue
             key = self.normalise_command(name)
             duplicate = next((existing for existing in cleaned if self.normalise_command(existing) == key), None)
@@ -481,12 +518,18 @@ class CMDEmulator:
     def atomic_write_json(self, path, payload):
         directory = os.path.dirname(os.path.abspath(path)) or "."
         temporary = os.path.join(directory, os.path.basename(path) + ".tmp")
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        try:
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            # Never leave a stray copy of the config next to the real one.
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
+            raise
 
     def save_config(self):
         if not self.config_file:
@@ -502,17 +545,22 @@ class CMDEmulator:
             self.emit_error("Unreadable config moved to", backup + "; starting a fresh one.")
             self.config_loaded = True
 
+        def merged(active, kind):
+            combined = dict(self.quarantined.get(kind, {}))
+            combined.update(active)
+            return combined
+
         config = {
             "version": CONFIG_VERSION,
-            "aliases": self.aliases,
-            "macros": self.macros,
-            "bookmarks": self.bookmarks,
-            "policy": self.policy,
+            "aliases": merged(self.aliases, "alias"),
+            "macros": merged(self.macros, "macro"),
+            "bookmarks": merged(self.bookmarks, "bookmark"),
+            "policy": self.stored_policy,
         }
         try:
             self.atomic_write_json(self.config_file, config)
             return True
-        except OSError as err:
+        except (OSError, TypeError, ValueError) as err:
             self.emit_error("Warning: could not save config:", err)
             return False
 
@@ -846,13 +894,21 @@ class CMDEmulator:
                 target, index = self.read_token(text, index)
                 if not target:
                     raise ValueError("missing target after '%s'" % char)
+                # 2>&1 duplicates a descriptor rather than naming a file. Without
+                # this, PyCMD would create a file literally called "&1".
+                if char == ">" and re.fullmatch(r"&[0-2]", target):
+                    redirections.append((descriptor, "dup", int(target[1:])))
+                    continue
                 redirections.append((descriptor, "r" if char == "<" else mode, target))
                 continue
             clean.append(char)
             index += 1
 
         if quote:
-            raise ValueError("unbalanced %s quote" % quote)
+            # An apostrophe in a filename (it's.txt, don't stop) is far commoner
+            # than deliberate quoting, and a half-parsed line cannot be trusted
+            # to say where a redirect begins. Treat the whole line literally.
+            return text.strip(), []
         return "".join(clean).strip(), redirections
 
     @contextlib.contextmanager
@@ -861,6 +917,18 @@ class CMDEmulator:
         saved = (self._stdout, self._stderr, self._pipe_input)
         try:
             for descriptor, mode, target in redirections:
+                if mode == "dup":
+                    # 2>&1 points stderr at wherever stdout currently goes, so
+                    # ordering matters exactly as it does in a real shell.
+                    if target == 1:
+                        source = self._stdout if self._stdout is not None else sys.stdout
+                    else:
+                        source = self._stderr if self._stderr is not None else sys.stderr
+                    if descriptor == 2:
+                        self._stderr = source
+                    else:
+                        self._stdout = source
+                    continue
                 path = os.path.expanduser(target)
                 if mode == "r":
                     with open(path, "r", encoding="utf-8", errors="replace") as stream:
@@ -890,7 +958,7 @@ class CMDEmulator:
     # Tables
     # ------------------------------------------------------------------
 
-    def render_table(self, rows, headers=None, max_width=None, minimum=8):
+    def render_table(self, rows, headers=None, max_width=None, minimum=8, truncate=True):
         rows = [list(row) for row in rows]
         if not rows:
             return []
@@ -909,7 +977,7 @@ class CMDEmulator:
         def total():
             return sum(widths) + 2 * (columns - 1)
 
-        while total() > max_width:
+        while truncate and total() > max_width:
             widest = max(range(columns), key=lambda index: widths[index])
             if widths[widest] <= minimum:
                 break
@@ -928,8 +996,8 @@ class CMDEmulator:
                 lines.append("  ".join("-" * width for width in widths).rstrip())
         return lines
 
-    def print_table(self, rows, headers=None):
-        for line in self.render_table(rows, headers=headers):
+    def print_table(self, rows, headers=None, truncate=True):
+        for line in self.render_table(rows, headers=headers, truncate=truncate):
             self.emit(line)
 
     # ------------------------------------------------------------------
@@ -1026,9 +1094,18 @@ class CMDEmulator:
         if any(char in command for char in "\"'*?"):
             return None
         try:
-            return shutil.which(os.path.expanduser(command))
+            found = shutil.which(os.path.expanduser(command))
         except (OSError, TypeError):
             return None
+        if not found:
+            return None
+        # On Windows shutil.which searches the current directory first. A bare
+        # word must never pick up a binary that merely happens to sit in the
+        # directory you cd'd into; require an explicit ./ or a path for that.
+        explicit = os.sep in command or (os.altsep and os.altsep in command)
+        if not explicit and os.path.dirname(os.path.abspath(found)) == os.getcwd():
+            return None
+        return found
 
     def check_unknown(self, command_line, alias_depth=0, macro_depth=0):
         """Vet an unrecognised command *before* anything irreversible happens.
@@ -1037,8 +1114,19 @@ class CMDEmulator:
         refused. Running this ahead of redirection is what stops a typo such as
         'dur > notes.txt' from truncating notes.txt on its way to being refused.
         """
+        # Follow aliases to the word that will actually execute. A single-level
+        # check would let `boom > notes.txt` (alias boom -> a typo) open and
+        # truncate notes.txt before the expansion is refused.
         command, _ = self.split_input(command_line)
-        if self.classify_command(command)[0] != "unknown":
+        seen = set()
+        for _ in range(self.MAX_EXPANSION_DEPTH):
+            kind, name, payload = self.classify_command(command)
+            if kind != "alias" or name in seen:
+                break
+            seen.add(name)
+            command, _ = self.split_input(payload)
+
+        if kind != "unknown":
             return None
         if self.resolve_program(command):
             return None
@@ -1070,7 +1158,7 @@ class CMDEmulator:
 
     def run_external(self, command_line, argv=None):
         """Run an external command, honouring any active capture or redirect."""
-        if not self.diverted and self._pipe_input is None:
+        if not self.redirected and self._pipe_input is None:
             if argv is not None:
                 return subprocess.run(argv, shell=False).returncode
             raw = os.system(command_line)
@@ -1128,15 +1216,20 @@ class CMDEmulator:
         if self.policy.get("operators", True) and not self.is_raw_tail(command_line):
             try:
                 segments = self.split_operators(command_line)
-            except ValueError as err:
-                self.emit_error("Input parse error:", err)
-                return 1
+            except ValueError:
+                # An unpaired quote is far more often a filename like it's.txt
+                # than an attempt at quoting, so treat the line as one command
+                # rather than refusing it outright.
+                segments = [(None, command_line)]
         else:
             segments = [(None, command_line)]
 
         groups = []
         for operator, text in segments:
             if operator == "|" and groups:
+                if not text.strip():
+                    self.emit_error("Syntax error: '|' must be followed by a command.")
+                    return 1
                 groups[-1][1].append(text)
             else:
                 groups.append((operator, [text]))
@@ -1187,7 +1280,7 @@ class CMDEmulator:
             return 1
 
         redirections = []
-        if not self.is_raw_tail(stage_text):
+        if self.policy.get("operators", True) and not self.is_raw_tail(stage_text):
             try:
                 stage_text, redirections = self.parse_redirections(stage_text)
             except ValueError as err:
@@ -1454,13 +1547,29 @@ class CMDEmulator:
     # Commands: basics
     # ------------------------------------------------------------------
 
+    def console_only(self, name):
+        """Refuse a console-side-effect command when output is diverted.
+
+        CLS and COLOR act on the real console handle, which no amount of stream
+        swapping touches. Running `CLS > log.txt` would wipe the user's screen
+        and leave an empty file, so decline instead.
+        """
+        if self.redirected or self._capture_depth:
+            self.emit_error("%s affects the console only; it does nothing when output is redirected." % name)
+            return True
+        return False
+
     def cmd_cls(self, args, arg_string=""):
+        if self.console_only("CLS"):
+            return False
         command = "cls" if platform.system() == "Windows" else "clear"
         return subprocess.call(command, shell=True) == 0
 
     def cmd_color(self, args, arg_string=""):
         if not args:
             self.emit_error("Usage: COLOR <code>")
+            return False
+        if self.console_only("COLOR"):
             return False
         if platform.system() != "Windows":
             self.emit_error("COLOR is only supported by Windows console hosts.")
@@ -1480,7 +1589,13 @@ class CMDEmulator:
             return False
 
     def cmd_echo(self, args, arg_string=""):
-        self.emit(arg_string)
+        # Quoting is the escape hatch for operator characters, so a wholly
+        # quoted argument must print without its quotes: ECHO "a|b" -> a|b.
+        text = arg_string.strip()
+        if len(args) == 1 and len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+            self.emit(text[1:-1])
+        else:
+            self.emit(arg_string)
         return True
 
     def cmd_time(self, args, arg_string=""):
@@ -1541,6 +1656,9 @@ class CMDEmulator:
         return status == 0
 
     def cmd_shell(self, args, arg_string=""):
+        if not self.authorise_shell("SHELL", "legacy"):
+            self.emit_error("SHELL is disabled by policy.")
+            return False
         self.emit("Launching external shell...")
         try:
             if platform.system() == "Windows":
@@ -1599,7 +1717,8 @@ class CMDEmulator:
             info = self.COMMAND_INFO.get(key)
             if info:
                 rows.append((info[1], info[2]))
-        self.print_table(rows)
+        # Never truncate help: losing part of a usage string is worse than wrapping.
+        self.print_table(rows, truncate=False)
         self.emit("")
         self.emit("Notes:")
         for note in (
@@ -1636,7 +1755,7 @@ class CMDEmulator:
             self.emit("")
             self.emit("%s:" % category)
             rows = sorted(grouped[category], key=lambda item: item[0])
-            self.print_table(rows, headers=("Command", "Usage", "Description"))
+            self.print_table(rows, headers=("Command", "Usage", "Description"), truncate=False)
         return True
 
     def cmd_config(self, args, arg_string=""):
@@ -1739,6 +1858,9 @@ class CMDEmulator:
 
         if kind == "macro":
             rows.append((label if not depth else "", indent + "macro " + name, payload))
+            if depth >= self.MAX_EXPANSION_DEPTH:
+                rows.append(("", indent + "  stopped", "possible macro loop"))
+                return False
             reaches_shell = False
             for step in self.split_macro_commands(payload):
                 reaches_shell = self.explain_chain(step, rows, "", depth + 1) or reaches_shell
@@ -1790,6 +1912,8 @@ class CMDEmulator:
                 return False
             self.policy[key] = value.strip().lower()
 
+        # An explicit POLICY command is a deliberate choice, so it is stored.
+        self.stored_policy[key] = self.policy[key]
         return self.persist(
             "Policy updated: %s -> %s" % (key, self.policy[key]),
             "(not persisted)",
@@ -1809,6 +1933,7 @@ class CMDEmulator:
             self.emit_error("Usage: RECORD [on|off]")
             return False
         self.policy["record"] = value in TRUE_WORDS
+        self.stored_policy["record"] = self.policy["record"]
         return self.persist(
             "Command recording %s." % ("enabled" if self.policy["record"] else "disabled"),
             "(not persisted)",
@@ -1910,21 +2035,35 @@ class CMDEmulator:
         return True
 
     def purge_history_records(self):
-        if not self.record_file or not os.path.exists(self.record_file):
+        # The rotated generation holds just as many command lines as the live
+        # file, so "records deleted" has to mean both or it is a false promise.
+        targets = [path for path in self.record_files() if os.path.exists(path)]
+        if not targets:
             self.emit("No on-disk history records to purge.")
             return True
-        size = self.record_file_size()
-        self.emit("Records file: %s (%.1f KiB)" % (self.record_file, size / 1024.0))
-        if not self.confirm("Delete the on-disk command records? [y/N] "):
+
+        total = sum(os.path.getsize(path) for path in targets)
+        for path in targets:
+            self.emit("Records file: %s (%.1f KiB)" % (path, os.path.getsize(path) / 1024.0))
+        if not self.confirm("Delete %d file(s), %.1f KiB of command records? [y/N] " % (len(targets), total / 1024.0)):
             self.emit_error("Cancelled; records kept.")
             return False
-        try:
-            os.remove(self.record_file)
-        except OSError as err:
-            self.emit_error("Could not delete records:", err)
-            return False
-        self.emit("On-disk command records deleted.")
-        return True
+
+        succeeded = True
+        for path in targets:
+            try:
+                os.remove(path)
+            except OSError as err:
+                self.emit_error("Could not delete records:", err)
+                succeeded = False
+        if succeeded:
+            self.emit("On-disk command records deleted.")
+        return succeeded
+
+    def record_files(self):
+        if not self.record_file:
+            return []
+        return [self.record_file, self.record_file + ".1"]
 
     def cmd_stats(self, args, arg_string=""):
         if not self.command_stats:
@@ -2055,16 +2194,29 @@ class CMDEmulator:
             self.emit("No macros defined.")
         return True
 
+    @staticmethod
+    def protect_substitution(value):
+        """Stop a macro argument being re-read as shell syntax.
+
+        The expansion is fed back through the parser, so an argument such as
+        '; DEL important.txt' would otherwise become a second command that the
+        macro's author never wrote. Values that contain no operator characters
+        are passed through untouched, so ordinary arguments look unchanged.
+        """
+        if not value or not any(char in value for char in ";|&<>"):
+            return value
+        return '"' + value.replace('"', "'") + '"'
+
     def expand_macro_command(self, command, args, arg_string):
         """Substitute {1}, {2} and {*} in a single pass, never rescanning."""
 
         def replace(match):
             token = match.group(1)
             if token == "*":
-                return arg_string
+                return self.protect_substitution(arg_string)
             index = int(token)
             if 1 <= index <= len(args):
-                return args[index - 1]
+                return self.protect_substitution(args[index - 1])
             return match.group(0)
 
         return re.sub(r"\{(\*|\d+)\}", replace, command)
@@ -2207,13 +2359,14 @@ class CMDEmulator:
         status = 0
         for number, raw in enumerate(lines, start=1):
             line = raw.strip()
-            if not line or line.startswith("#") or line[:4].upper() == "REM ":
+            first = line.split(None, 1)[0].upper() if line.split() else ""
+            if not line or line.startswith("#") or first == "REM":
                 continue
             if not self.execute_line(line, record_history=False):
-                status = self.last_status or 1
                 self.emit_error("Script %s failed at line %d: %s" % (path, number, line))
                 if self.policy.get("stop_on_error", False):
-                    return status
+                    return self.last_status or 1
+            status = self.last_status
             if not self.running:
                 break
         return status
@@ -2289,8 +2442,17 @@ def main(argv=None):
         show_banner=not (options.no_banner or one_shot),
     )
 
+    # These override the session only. stored_policy is left alone, so a single
+    # --safe-mode run cannot silently lock down every future session.
     if options.safe_mode:
-        emulator.policy.update({"shell_fallback": "off", "legacy": False, "run_shell": False})
+        emulator.policy.update(
+            {
+                "shell_fallback": "off",
+                "path_programs": False,
+                "legacy": False,
+                "run_shell": False,
+            }
+        )
     elif one_shot:
         # A typo in a script must never become a shell command with nobody watching.
         emulator.policy["shell_fallback"] = "off"

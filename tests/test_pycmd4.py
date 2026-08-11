@@ -612,6 +612,158 @@ class RecordTests(EmulatorTestCase):
         self.assertLessEqual(len(records), 10)
 
 
+class ReviewRegressionTests(EmulatorTestCase):
+    """Each of these reproduces a defect found by the 4.0 review."""
+
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+
+    def test_macro_argument_cannot_inject_a_second_command(self):
+        """A macro argument is data; it must never be re-read as syntax."""
+        victim = self.root / "victim.txt"
+        victim.write_text("IMPORTANT", encoding="utf-8")
+        self.run_command("MACRO show ECHO {1}")
+        with mock.patch("PythonCMD.os.system") as system:
+            self.run_command('RUNMACRO show "hi ; DEL --force victim.txt"')
+        system.assert_not_called()
+        self.assertTrue(victim.exists(), "the argument was executed as a command")
+
+    def test_protect_substitution_leaves_ordinary_arguments_alone(self):
+        self.assertEqual(self.emulator.protect_substitution("world wide"), "world wide")
+        self.assertEqual(self.emulator.protect_substitution("--details"), "--details")
+        self.assertTrue(self.emulator.protect_substitution("; DEL x").startswith('"'))
+
+    def test_alias_to_a_typo_does_not_truncate_the_redirect_target(self):
+        precious = self.root / "precious.txt"
+        precious.write_text("IMPORTANT DATA", encoding="utf-8")
+        self.run_command("ALIAS boom definitelynotacommand")
+        result, _, _ = self.run_command("boom > precious.txt")
+        self.assertFalse(result)
+        self.assertEqual(precious.read_text(encoding="utf-8"), "IMPORTANT DATA")
+
+    def test_descriptor_duplication_is_not_a_filename(self):
+        text, redirections = self.emulator.parse_redirections("ECHO x 2>&1")
+        self.assertEqual(text, "ECHO x")
+        self.assertEqual(redirections, [(2, "dup", 1)])
+        self.run_command("ECHO x 2>&1")
+        self.assertFalse((self.root / "&1").exists())
+
+    def test_stderr_redirection_of_an_external_program_captures_it(self):
+        helper = self.root / "noisy.py"
+        helper.write_text("import sys; sys.stderr.write('TO-STDERR\\n')", encoding="utf-8")
+        target = self.root / "err.txt"
+        target.write_text("PREEXISTING", encoding="utf-8")
+        interpreter = os.path.basename(sys.executable)
+        result, _, _ = self.run_command('%s "%s" 2> err.txt' % (interpreter, helper))
+        self.assertTrue(result)
+        self.assertIn("TO-STDERR", target.read_text(encoding="utf-8"))
+
+    def test_a_program_in_the_current_directory_is_not_a_bare_command(self):
+        """shutil.which searches the cwd on Windows before 3.12."""
+        planted = str(self.root / "dur.exe")
+        with mock.patch("PythonCMD.shutil.which", return_value=planted):
+            self.assertIsNone(self.emulator.resolve_program("dur"))
+            self.assertEqual(self.emulator.resolve_program("./dur"), planted)
+
+    def test_safe_mode_overrides_are_not_written_to_the_config(self):
+        self.run_command("POLICY shell_fallback always")
+        self.emulator.policy["shell_fallback"] = "off"  # what --safe-mode does
+        self.run_command("ALIAS ll DIR")
+        self.assertEqual(self.make_emulator().policy["shell_fallback"], "always")
+
+    def test_rejected_config_entries_are_kept_on_disk(self):
+        path = self.root / "legacy.json"
+        payload = {"version": 2, "aliases": {"record": "DIR", "keepme": "PWD"}, "macros": {}, "bookmarks": {}}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            emulator = self.make_emulator(config_file=str(path))
+        self.assertNotIn("record", emulator.aliases)
+        self.run_command("ALIAS other ECHO x", emulator=emulator)
+        saved = json.loads(path.read_text(encoding="utf-8"))["aliases"]
+        self.assertIn("record", saved, "a rejected entry must not be deleted from disk")
+        self.assertIn("other", saved)
+
+    def test_apostrophes_do_not_abort_the_line(self):
+        """An unpaired quote is usually a filename, not a quoting attempt."""
+        result, output, _ = self.run_command("ECHO don't stop")
+        self.assertTrue(result)
+        self.assertIn("don't stop", output)
+
+        target = self.root / "it's.txt"
+        target.write_text("x", encoding="utf-8")
+        result, output, _ = self.run_command("DEL --dry-run it's.txt")
+        self.assertTrue(result)
+        self.assertIn("it's.txt", output)
+        self.assertTrue(target.exists())
+
+    def test_operators_policy_off_also_disables_redirection(self):
+        self.emulator.policy["operators"] = False
+        _, output, _ = self.run_command("ECHO literal > out.txt")
+        self.assertIn("literal > out.txt", output)
+        self.assertFalse((self.root / "out.txt").exists())
+
+    def test_trailing_pipe_is_a_syntax_error(self):
+        result, _, errors = self.run_command("ECHO a |")
+        self.assertFalse(result)
+        self.assertIn("must be followed by a command", errors)
+
+    def test_cls_refuses_when_output_is_redirected(self):
+        with mock.patch("PythonCMD.subprocess.call") as call:
+            result, _, _ = self.run_command("CLS > log.txt")
+        call.assert_not_called()
+        self.assertFalse(result)
+
+    def test_echo_prints_quoted_operators_literally(self):
+        _, output, _ = self.run_command('ECHO "a|b and 3 && 4"')
+        self.assertIn("a|b and 3 && 4", output)
+
+    def test_shell_is_gated_by_policy(self):
+        self.emulator.policy["legacy"] = False
+        with mock.patch("PythonCMD.subprocess.Popen") as popen:
+            result, _, errors = self.run_command("SHELL")
+        popen.assert_not_called()
+        self.assertFalse(result)
+        self.assertIn("disabled by policy", errors)
+
+    def test_help_output_is_never_truncated(self):
+        _, output, _ = self.run_command("COMMANDS Execution")
+        self.assertIn("RUN [--safe] <command>", output)
+
+    def test_explain_of_a_self_referential_macro_terminates(self):
+        self.emulator.macros["loop"] = "RUNMACRO loop; loop"
+        self.emulator.rebuild_indexes()
+        result, _, _ = self.run_command("EXPLAIN loop")
+        self.assertTrue(result)
+
+    def test_purge_removes_the_rotated_record_file(self):
+        rotated = Path(self.emulator.record_file + ".1")
+        Path(self.emulator.record_file).write_text("{}\n", encoding="utf-8")
+        rotated.write_text("{}\n", encoding="utf-8")
+        self.emulator.interactive = True
+        with mock.patch("builtins.input", return_value="y"):
+            self.run_command("HISTORY --purge")
+        self.assertFalse(rotated.exists(), "the rotated generation was left behind")
+
+    def test_failed_config_write_leaves_no_temporary_file(self):
+        with mock.patch("PythonCMD.os.replace", side_effect=OSError("denied")):
+            self.run_command("ALIAS ll DIR")
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_emit_degrades_rather_than_dropping_unencodable_text(self):
+        class NarrowStream(io.StringIO):
+            encoding = "ascii"
+
+            def write(self, text):
+                text.encode("ascii")  # raises UnicodeEncodeError like a console
+                return super().write(text)
+
+        stream = NarrowStream()
+        emulator = self.make_emulator(stdout=stream)
+        emulator.emit("café — naïve")
+        self.assertTrue(stream.getvalue().strip(), "the line was silently dropped")
+
+
 class CommandLineTests(unittest.TestCase):
     """End-to-end coverage of main(), which nothing exercised before 4.0."""
 
