@@ -1,58 +1,151 @@
 # PyCMD
 
 PyCMD is a small Python command shell for Windows-style workflows when you want
-a simple CMD-like prompt from Python.
+a simple CMD-like prompt from Python. It is a single file with no third-party
+dependencies — copy `PythonCMD.py` anywhere and run it.
 
-## Features
+Version 4.0 is about making the shell **predictable**: a typo can no longer
+reach the OS shell, what you type is what runs, and the whole thing can be
+scripted without a human at the keyboard.
 
-- Basic commands: `CWD`, `CD`, `CLS`, `DIR`, `PWD`, `MKDIR`, `DEL`, `ECHO`,
-  `RUN`, `TIME`, and `DATE`.
-- Discovery commands: `HELP <command>`, `COMMANDS`, `SUGGEST`, and typo
-  suggestions for unknown commands. `? <command>` and `??` are quick help
-  shortcuts.
-- Persistent aliases with `ALIAS`, `UNALIAS`, and `LISTALIASES`.
-- Persistent macros with `MACRO`, `RUNMACRO`, `UNMACRO`, and `LISTMACROS`.
-  Macros can use `{1}`, `{2}`, and `{*}` placeholders for arguments.
-- Directory bookmarks with `BOOKMARK`, `JUMP`, `UNBOOKMARK`, and
-  `LISTBOOKMARKS`.
-- Session history, searchable history records, and command timing stats.
-- Safer execution mode with `RUN --safe <program> [args]`.
-- Compact directory trees with `TREE [path] [depth]`.
-- Shell shortcut execution with `!<command>`.
-- Optional `readline` integration for history and tab completion when the host
-  Python build supports it, including filesystem-aware suggestions.
-
-## Usage
-
-Run:
+## Quick start
 
 ```powershell
 python PythonCMD.py
 ```
 
-Useful examples:
+```text
+HELP                      general help
+COMMANDS                  every command, grouped by category
+? RUN                     help for one command
+EXPLAIN <line>            show exactly how PyCMD will interpret a line
+```
+
+## Features
+
+- **Builtins**: `CWD`/`CD`, `PWD`, `DIR`, `TREE`, `MKDIR`, `DEL`, `ECHO`, `CLS`,
+  `COLOR`, `TIME`, `DATE`, `WHICH`, `SHELL`.
+- **Operators**: chain commands with `&&` (on success), `||` (on failure) and
+  `;` (always). A single `&` stays literal, so `DEL A&B.txt` still works.
+- **Redirection for builtins**: `>`, `>>`, `2>` and `<` work on PyCMD's own
+  commands, not just external programs — `DIR --details > listing.txt`.
+- **Pipes**: send builtin output into a real program, e.g.
+  `DIR --details | findstr .py`.
+- **Execution policy**: an unrecognised command is *not* silently handed to
+  `cmd.exe` (see below).
+- **Persistent aliases** (`ALIAS`, `UNALIAS`, `LISTALIASES`), **macros**
+  (`MACRO`, `RUNMACRO`, `UNMACRO`, `LISTMACROS`) with `{1}`, `{2}` and `{*}`
+  placeholders, and **bookmarks** (`BOOKMARK`, `JUMP`, `UNBOOKMARK`,
+  `LISTBOOKMARKS`). Names are case-insensitive and cannot shadow a builtin.
+- **Insight**: `HISTORY` (with search and purge), `STATS`, `SUGGEST`, and
+  `EXPLAIN` for showing how a line resolves before you run it.
+- **Non-interactive mode**: `-c`, script files, and real exit codes.
+- Optional `readline` integration for history and context-aware tab completion.
+
+## How a command is resolved
+
+PyCMD tries each layer in order, and `EXPLAIN` will show you the result:
+
+1. **alias** → expanded and re-parsed
+2. **macro** → each `;`-separated step is run in turn
+3. **builtin** → dispatched directly
+4. **program on PATH** → run directly via `argv`, with no shell in between
+5. **anything else** → treated as a typo (see the policy below)
+
+## Execution policy — the 4.0 behaviour change
+
+In 3.0, an unrecognised command was passed straight to `os.system`. That meant a
+one-key typo could destroy a file:
+
+```text
+dur > notes.txt     # 3.0: "Command not recognized" ... then cmd.exe truncates notes.txt
+```
+
+In 4.0 a word that is neither a builtin nor a program on your PATH is treated as
+a typo. Nothing is opened, nothing is truncated, and the line is refused (or
+confirmed first, when you are at an interactive prompt).
+
+Real programs are unaffected: `git status`, `python --version` and
+`findstr pattern` all resolve on PATH and run directly, with no shell involved.
+
+Inspect and change the policy with `POLICY`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `shell_fallback` | `confirm` | What happens to an unknown word: `off`, `confirm`, or `always` (the 3.0 behaviour). |
+| `path_programs` | `on` | Run words that resolve on PATH directly via `argv`. |
+| `legacy` | `on` | Allow `LEGACY` and `!`. |
+| `run_shell` | `on` | Allow `RUN`'s shell mode (`RUN --safe` is unaffected). |
+| `operators` | `on` | Parse `&&`, `\|\|`, `;`, `\|` and redirection. Turn off for 3.0 line handling. |
+| `record` | `on` | Write the on-disk command record. |
+| `stop_on_error` | `off` | Stop a macro or script at the first failing command. |
+
+```text
+POLICY                          show the current policy
+POLICY shell_fallback always    restore 3.0 behaviour
+```
+
+Every documented route to the OS shell is still one keystroke away and never
+prompts: `!<command>`, `LEGACY <command>`, and `RUN <command>`.
+
+## Usage examples
 
 ```text
 HELP DIR
-? RUN
-??
-COMMANDS
 DIR --details
 TREE . 2
+ECHO built > log.txt && ECHO done
+DIR --details | findstr .py
 ALIAS ll DIR --details
 MACRO quick ECHO hello {1}; TIME
-RUNMACRO quick kai
-BOOKMARK project C:\Users\kai99\Desktop\PyCMD
+RUNMACRO --dry-run quick kai
+BOOKMARK project C:\Users\kai99\Downloads\PyCMD
 JUMP project
 HISTORY search python
-DEL --dry-run example.txt
+DEL --dry-run *.tmp
 RUN --safe python --version
 !echo shell shortcut
+EXPLAIN ll | findstr py
 ```
 
-`RUN <command>` preserves the original shell-style behavior for compatibility.
-Use `RUN --safe` when you want to execute a program without shell metacharacter
-expansion.
+## Command line
+
+```powershell
+python PythonCMD.py                      # interactive
+python PythonCMD.py -c "ECHO hi"         # one-shot, then exit
+python PythonCMD.py script.pycmd         # run a file of PyCMD commands
+python PythonCMD.py --safe-mode          # no route to the OS shell at all
+python PythonCMD.py --version
+```
+
+The process exit code is the status of the last command, so PyCMD can be used
+inside a batch file or a CI step. In one-shot and script mode the shell fallback
+is forced to `off`, because a typo in a script must never become a shell command
+with nobody watching. Blank lines and lines starting with `#` or `REM` are
+skipped in scripts.
+
+## Files PyCMD writes
+
+| File | Contents |
+|---|---|
+| `~/.pycmd_config.json` | Aliases, macros, bookmarks and policy. Written atomically. |
+| `~/.pycmd_history.jsonl` | **Every command line you type**, with its working directory. Rotates at 2 MiB. |
+| `~/.cmd_emulator_history` | The `readline` line-editing history. |
+
+Because the record file captures everything you type, treat it as sensitive.
+Turn it off with `RECORD off`, and delete it with `HISTORY --purge`.
+`HISTORY --clear` only clears the in-memory session list and says so.
+
+## Notes and limitations
+
+- Redirected output is written as UTF-8, not the console code page.
+- Builtins do not read piped input; a pipe feeds the next *program*, so
+  `DIR | findstr x` works and `DIR | ECHO x` discards the input.
+- `!` and `LEGACY` pass their tail to the OS shell verbatim, so operators and
+  redirection in those lines are the shell's to interpret, not PyCMD's.
+- On Windows, stock CPython has no `readline`, so tab completion and line
+  editing are unavailable until you `pip install pyreadline3`. PyCMD itself
+  needs nothing installed; it reports the backend in `CONFIG`.
 
 ## Development
 
@@ -61,6 +154,9 @@ Run tests with:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+`tests/test_pythoncmd.py` is the 3.0 regression contract and is deliberately
+left unchanged; `tests/test_pycmd4.py` covers the 4.0 behaviour.
 
 Project style: prefer British spelling in new function names and documentation
 where it reads naturally.

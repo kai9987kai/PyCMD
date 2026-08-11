@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycmd-shell"
+description = "A small, predictable CMD-style shell written in pure Python."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dynamic = ["version"]
+
+# PyCMD is deliberately dependency-free: PythonCMD.py must stay runnable on its
+# own with nothing installed. Do not add runtime dependencies here.
+dependencies = []
+
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Shells",
+]
+
+[project.optional-dependencies]
+# Enables tab completion and line editing on Windows, where stock CPython ships
+# without readline. Never required.
+windows-readline = ["pyreadline3; sys_platform == 'win32'"]
+
+[project.scripts]
+pycmd = "PythonCMD:main"
+
+[tool.setuptools]
+py-modules = ["PythonCMD"]
+
+[tool.setuptools.dynamic]
+version = { attr = "PythonCMD.__version__" }

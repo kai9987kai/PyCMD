@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
-Advanced CMD Emulator for Windows [Version 3.0 - Enhanced 2026]
+Advanced CMD Emulator for Windows [Version 4.0 - Enhanced 2026]
 By Jared (C)03/2019 - Enhanced 2026
 Contribution credits
 kai9987kai
 
-PyCMD keeps the original simple command surface and adds a practical shell
-quality-of-life features: better command discovery, optional persistent
-aliases, directory bookmarks, command suggestions, and lightweight stats.
+PyCMD keeps the original simple command surface and adds the things a shell
+needs to be predictable: an execution policy so a typo can never reach the OS
+shell unannounced, real operators (``&&``, ``||``, ``;``), redirection and
+pipes that work for PyCMD's own builtins, persistent aliases, macros and
+bookmarks, and a non-interactive mode so the shell can be scripted.
 
 For best functionality, run this on the Python command line.
 Visit my GitHub: http://www.github.com/Jared-dareJ/
 """
 
+import argparse
 import atexit
+import collections
+import contextlib
 import difflib
 import getpass
+import glob
+import io
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -31,9 +39,34 @@ except ImportError:  # pragma: no cover - depends on the host Python build
     readline = None
 
 
+__version__ = "4.0.0"
+
 HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".cmd_emulator_history")
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".pycmd_config.json")
 RECORD_FILE = os.path.join(os.path.expanduser("~"), ".pycmd_history.jsonl")
+
+CONFIG_VERSION = 2
+RECORD_MAX_BYTES = 2 * 1024 * 1024
+RECORD_WINDOW_BYTES = 256 * 1024
+READLINE_HISTORY_LENGTH = 2000
+
+SCRIPT_PATH = os.path.abspath(sys.argv[0])
+LAUNCH_ARGV = list(sys.argv[1:])
+
+DEFAULT_POLICY = {
+    "shell_fallback": "confirm",
+    "path_programs": True,
+    "legacy": True,
+    "run_shell": True,
+    "operators": True,
+    "record": True,
+    "stop_on_error": False,
+}
+
+POLICY_CHOICES = {"shell_fallback": ("off", "confirm", "always")}
+
+TRUE_WORDS = ("on", "true", "yes", "1", "enabled")
+FALSE_WORDS = ("off", "false", "no", "0", "disabled")
 
 
 class CMDEmulator:
@@ -42,8 +75,10 @@ class CMDEmulator:
         "CD": ("Navigation", "CD <directory>", "Alias for CWD."),
         "PWD": ("Navigation", "PWD", "Display the current working directory."),
         "DIR": ("Files", "DIR [path] [--details]", "List directory contents."),
-        "MKDIR": ("Files", "MKDIR <directory>", "Create a new directory."),
-        "DEL": ("Files", "DEL [--dry-run] <filename>", "Delete a file."),
+        "MKDIR": ("Files", "MKDIR <directory> [more...]", "Create one or more directories."),
+        "DEL": ("Files", "DEL [--dry-run] [--force] <file> [more...]", "Delete files; wildcards are expanded."),
+        "ERASE": ("Files", "ERASE [--dry-run] [--force] <file> [more...]", "Alias for DEL."),
+        "TREE": ("Files", "TREE [path] [depth]", "Show a compact directory tree."),
         "ECHO": ("Basic", "ECHO <text>", "Display the given text."),
         "CLS": ("Basic", "CLS", "Clear the screen."),
         "COLOR": ("Basic", "COLOR <code>", "Change Windows console color."),
@@ -58,26 +93,51 @@ class CMDEmulator:
         "UNALIAS": ("Productivity", "UNALIAS <name>", "Remove an alias."),
         "LISTALIASES": ("Productivity", "LISTALIASES", "List all aliases."),
         "MACRO": ("Productivity", "MACRO <name> <cmd>; <cmd>", "Save a multi-command workflow."),
-        "RUNMACRO": ("Productivity", "RUNMACRO <name> [args]", "Run a saved macro."),
+        "RUNMACRO": ("Productivity", "RUNMACRO [--dry-run] [--stop] <name> [args]", "Run a saved macro."),
         "UNMACRO": ("Productivity", "UNMACRO <name>", "Remove a saved macro."),
         "LISTMACROS": ("Productivity", "LISTMACROS", "List all saved macros."),
         "BOOKMARK": ("Productivity", "BOOKMARK <name> [path]", "Save a directory bookmark."),
         "JUMP": ("Productivity", "JUMP <name>", "Change to a saved bookmark."),
         "UNBOOKMARK": ("Productivity", "UNBOOKMARK <name>", "Remove a directory bookmark."),
         "LISTBOOKMARKS": ("Productivity", "LISTBOOKMARKS", "List directory bookmarks."),
-        "HISTORY": ("Insight", "HISTORY [limit|last n|search text|--clear]", "Show, search, or clear session history."),
+        "HISTORY": ("Insight", "HISTORY [limit|last n|search text|--clear|--purge]", "Show, search, or clear history."),
         "STATS": ("Insight", "STATS", "Show command counts, failures, and slow commands."),
         "SUGGEST": ("Insight", "SUGGEST <text>", "Show command and alias suggestions."),
-        "COMMANDS": ("Help", "COMMANDS", "List commands grouped by category."),
+        "EXPLAIN": ("Insight", "EXPLAIN <command line>", "Show how PyCMD will interpret a line."),
+        "POLICY": ("Safety", "POLICY [key value]", "Show or change execution policy."),
+        "RECORD": ("Safety", "RECORD [on|off]", "Show or change on-disk command recording."),
+        "COMMANDS": ("Help", "COMMANDS [category]", "List commands grouped by category."),
         "HELP": ("Help", "HELP [command]", "Show general or command-specific help."),
         "_HELP": ("Help", "_HELP [command]", "Alias for HELP."),
         "?": ("Help", "? [command]", "Shortcut for HELP."),
-        "??": ("Help", "??", "Shortcut for COMMANDS."),
+        "??": ("Help", "?? [category]", "Shortcut for COMMANDS."),
         "CONFIG": ("Help", "CONFIG", "Show PyCMD config and history locations."),
-        "TREE": ("Files", "TREE [path] [depth]", "Show a compact directory tree."),
         "RESTART": ("Session", "RESTART", "Restart the CMD Emulator session."),
         "EXIT": ("Session", "EXIT", "Exit the emulator."),
     }
+
+    FEATURED = (
+        "CWD",
+        "DIR",
+        "TREE",
+        "RUN",
+        "!",
+        "ALIAS",
+        "MACRO",
+        "BOOKMARK",
+        "HISTORY",
+        "STATS",
+        "EXPLAIN",
+        "POLICY",
+        "EXIT",
+    )
+
+    # Commands whose tail is data, not a command line: either the OS shell owns
+    # it verbatim, or it is a definition body that must keep its own operators.
+    RAW_TAIL_COMMANDS = ("!", "LEGACY", "RUN", "ALIAS", "MACRO", "EXPLAIN")
+    OPERATORS = ("&&", "||", "|", ";")
+    NAME_FORBIDDEN = set(" \t\"'`;|&<>()")
+    MAX_EXPANSION_DEPTH = 10
 
     def __init__(
         self,
@@ -85,18 +145,48 @@ class CMDEmulator:
         config_file=CONFIG_FILE,
         record_file=RECORD_FILE,
         auto_persist_history=True,
+        stdout=None,
+        stderr=None,
+        interactive=None,
+        show_banner=True,
     ):
         self.prompt = ""
         self.history = []
         self.aliases = {}
         self.macros = {}
         self.bookmarks = {}
-        self.command_stats = []
+        self.policy = dict(DEFAULT_POLICY)
+        self.command_stats = collections.deque(maxlen=200)
         self.history_file = history_file
         self.config_file = config_file
         self.record_file = record_file
         self.record_write_failed = False
+        self.config_loaded = True
         self.running = True
+        self.last_status = 0
+        self.readline_backend = None
+        self.show_banner = show_banner
+
+        # Output plumbing. These stay None unless a caller (or a redirection)
+        # diverts them, so `self.out` resolves lazily against the live
+        # sys.stdout and contextlib.redirect_stdout keeps working.
+        self._stdout = stdout
+        self._stderr = stderr
+        self._pipe_input = None
+        self._capture_depth = 0
+        # Authoritative macro nesting counter. RUNMACRO is a normal handler and
+        # cannot receive a depth argument, so the guard has to live on self or a
+        # macro that invokes itself by name recurses until Python's stack gives.
+        self._macro_depth = 0
+        self._executing_line = None
+        self._completion_cache = (None, [])
+
+        if interactive is None:
+            try:
+                interactive = bool(sys.stdin) and sys.stdin.isatty()
+            except (AttributeError, ValueError, OSError):
+                interactive = False
+        self.interactive = interactive
 
         self.commands = {
             "CWD": self.cmd_cwd,
@@ -115,6 +205,7 @@ class CMDEmulator:
             "TREE": self.cmd_tree,
             "MKDIR": self.cmd_mkdir,
             "DEL": self.cmd_del,
+            "ERASE": self.cmd_del,
             "PWD": self.cmd_pwd,
             "ECHO": self.cmd_echo,
             "RUN": self.cmd_run,
@@ -123,6 +214,9 @@ class CMDEmulator:
             "HISTORY": self.cmd_history,
             "STATS": self.cmd_stats,
             "SUGGEST": self.cmd_suggest,
+            "EXPLAIN": self.cmd_explain,
+            "POLICY": self.cmd_policy,
+            "RECORD": self.cmd_record,
             "ALIAS": self.cmd_alias,
             "UNALIAS": self.cmd_unalias,
             "LISTALIASES": self.cmd_listaliases,
@@ -140,14 +234,129 @@ class CMDEmulator:
             "EXIT": self.cmd_exit,
         }
 
+        # Which candidate set completes the operands of each command.
+        self.command_completers = {
+            "JUMP": "bookmarks",
+            "UNBOOKMARK": "bookmarks",
+            "RUNMACRO": "macros",
+            "UNMACRO": "macros",
+            "UNALIAS": "aliases",
+            "HELP": "topics",
+            "_HELP": "topics",
+            "?": "topics",
+            "CWD": "directories",
+            "CD": "directories",
+            "TREE": "directories",
+            "MKDIR": "directories",
+            "BOOKMARK": "directories",
+            "POLICY": "policy",
+        }
+
+        self.rebuild_indexes()
         self.load_config()
         self.configure_readline(auto_persist_history)
         self.update_prompt()
+        self.check_command_registry()
+
+    # ------------------------------------------------------------------
+    # Output plumbing
+    # ------------------------------------------------------------------
+
+    @property
+    def out(self):
+        return self._stdout if self._stdout is not None else sys.stdout
+
+    @property
+    def err(self):
+        # Diagnostics follow 2> only. When stdout alone is diverted they stay on
+        # the console, so `DIR nosuch > out.txt` reports the error to the user
+        # rather than folding it silently into the file.
+        return self._stderr if self._stderr is not None else sys.stderr
+
+    @property
+    def diverted(self):
+        """True when normal output is going somewhere other than the console."""
+        return self._stdout is not None
+
+    def emit(self, *values, **kwargs):
+        separator = kwargs.pop("sep", " ")
+        end = kwargs.pop("end", "\n")
+        if kwargs:
+            raise TypeError("emit() got unexpected keyword arguments: %s" % sorted(kwargs))
+        text = separator.join(str(value) for value in values) + end
+        try:
+            self.out.write(text)
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def emit_error(self, *values):
+        text = " ".join(str(value) for value in values) + "\n"
+        try:
+            self.err.write(text)
+        except (BrokenPipeError, ValueError):
+            pass
+
+    def ask(self, question):
+        """Prompt the user. Returns '' when there is nobody to answer."""
+        if not self.interactive:
+            return ""
+        try:
+            return input(question)
+        except (EOFError, KeyboardInterrupt):
+            self.emit("")
+            return ""
+
+    def confirm(self, question):
+        return self.ask(question).strip().lower() in ("y", "yes")
+
+    # ------------------------------------------------------------------
+    # Prompt
+    # ------------------------------------------------------------------
 
     def update_prompt(self):
-        self.prompt = os.getcwd() + "> "
+        self.prompt = self.shorten_path(os.getcwd()) + "> "
+
+    def shorten_path(self, path, budget=None):
+        """Keep the prompt narrow enough to leave room for typing."""
+        home = os.path.expanduser("~")
+        if home and path.startswith(home):
+            path = "~" + path[len(home):]
+        if budget is None:
+            budget = max(20, self.terminal_width() // 3)
+        if len(path) <= budget:
+            return path
+        parts = [part for part in path.replace("\\", "/").split("/") if part]
+        if len(parts) <= 2:
+            return path[-budget:]
+        shortened = parts[0] + "/.../" + "/".join(parts[-2:])
+        if len(shortened) > budget:
+            shortened = ".../" + parts[-1]
+        return shortened
+
+    @staticmethod
+    def terminal_width(default=80):
+        try:
+            return shutil.get_terminal_size((default, 24)).columns
+        except (OSError, ValueError):
+            return default
+
+    # ------------------------------------------------------------------
+    # readline
+    # ------------------------------------------------------------------
+
+    def detect_readline_backend(self):
+        if readline is None:
+            return None
+        documentation = getattr(readline, "__doc__", "") or ""
+        location = getattr(readline, "__file__", "") or ""
+        if "libedit" in documentation:
+            return "libedit"
+        if "pyreadline" in documentation.lower() or "site-packages" in location:
+            return "pyreadline3"
+        return "GNU readline"
 
     def configure_readline(self, auto_persist_history):
+        self.readline_backend = self.detect_readline_backend()
         if readline is None:
             return
 
@@ -157,13 +366,26 @@ class CMDEmulator:
             except FileNotFoundError:
                 pass
             except OSError as err:
-                print("Warning: could not read history file:", err)
+                self.emit_error("Warning: could not read history file:", err)
 
         try:
+            existing = readline.get_current_history_length()
+        except Exception:  # pragma: no cover - backend dependent
+            existing = 0
+        try:
+            readline.set_history_length(max(READLINE_HISTORY_LENGTH, existing))
+        except Exception:  # pragma: no cover - backend dependent
+            pass
+
+        try:
+            readline.set_completer_delims(" \t\n")
             readline.set_completer(self.complete)
-            readline.parse_and_bind("tab: complete")
+            if self.readline_backend == "libedit":
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
         except Exception as err:
-            print("Warning: command completion is unavailable:", err)
+            self.emit_error("Warning: command completion is unavailable:", err)
 
         if auto_persist_history and self.history_file:
             atexit.register(self.save_readline_history)
@@ -174,55 +396,237 @@ class CMDEmulator:
         try:
             readline.write_history_file(self.history_file)
         except OSError as err:
-            print("Warning: could not save history file:", err)
+            self.emit_error("Warning: could not save history file:", err)
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
 
     def load_config(self):
         if not self.config_file:
             return
         try:
-            with open(self.config_file, "r", encoding="utf-8") as config_stream:
+            with open(self.config_file, "r", encoding="utf-8-sig") as config_stream:
                 config = json.load(config_stream)
         except FileNotFoundError:
+            self.config_loaded = True
             return
-        except (OSError, json.JSONDecodeError) as err:
-            print("Warning: could not load config:", err)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as err:
+            self.config_loaded = False
+            self.emit_error("Warning: could not load config:", err)
             return
 
-        aliases = config.get("aliases", {})
-        macros = config.get("macros", {})
-        bookmarks = config.get("bookmarks", {})
-        if isinstance(aliases, dict):
-            self.aliases = {str(name): str(command) for name, command in aliases.items()}
-        if isinstance(macros, dict):
-            self.macros = {str(name): str(command) for name, command in macros.items()}
-        if isinstance(bookmarks, dict):
-            self.bookmarks = {str(name): str(path) for name, path in bookmarks.items()}
+        if not isinstance(config, dict):
+            self.config_loaded = False
+            self.emit_error("Warning: config file is not a JSON object; ignoring it.")
+            return
+
+        self.config_loaded = True
+        self.aliases = self.load_name_map(config.get("aliases"), "alias")
+        self.macros = self.load_name_map(config.get("macros"), "macro")
+        self.bookmarks = self.load_name_map(config.get("bookmarks"), "bookmark")
+
+        policy = config.get("policy")
+        if isinstance(policy, dict):
+            for key, value in policy.items():
+                if key in DEFAULT_POLICY:
+                    self.policy[key] = value
+        self.normalise_policy()
+        self.rebuild_indexes()
+
+    def load_name_map(self, raw, kind):
+        """Validate a persisted name -> text mapping, reporting what is dropped."""
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for name, value in raw.items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                self.emit_error("Warning: ignoring non-text %s entry: %r" % (kind, name))
+                continue
+            ok, reason = self.validate_name(name, kind)
+            if not ok:
+                self.emit_error("Warning: ignoring %s '%s': %s" % (kind, name, reason))
+                continue
+            key = self.normalise_command(name)
+            duplicate = next((existing for existing in cleaned if self.normalise_command(existing) == key), None)
+            if duplicate is not None:
+                self.emit_error(
+                    "Warning: %s '%s' collides with '%s'; keeping the first." % (kind, name, duplicate)
+                )
+                continue
+            cleaned[name] = value
+        return cleaned
+
+    def normalise_policy(self):
+        for key, default in DEFAULT_POLICY.items():
+            value = self.policy.get(key, default)
+            if isinstance(default, bool):
+                self.policy[key] = self.coerce_bool(value, default)
+            else:
+                choices = POLICY_CHOICES.get(key, ())
+                text = str(value).strip().lower()
+                self.policy[key] = text if text in choices else default
+
+    @staticmethod
+    def coerce_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in TRUE_WORDS:
+            return True
+        if text in FALSE_WORDS:
+            return False
+        return default
+
+    def atomic_write_json(self, path, payload):
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        temporary = os.path.join(directory, os.path.basename(path) + ".tmp")
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
 
     def save_config(self):
         if not self.config_file:
             return False
+
+        if not self.config_loaded and os.path.exists(self.config_file):
+            backup = self.config_file + ".bak"
+            try:
+                os.replace(self.config_file, backup)
+            except OSError as err:
+                self.emit_error("Refusing to overwrite an unreadable config:", err)
+                return False
+            self.emit_error("Unreadable config moved to", backup + "; starting a fresh one.")
+            self.config_loaded = True
+
         config = {
-            "version": 1,
+            "version": CONFIG_VERSION,
             "aliases": self.aliases,
             "macros": self.macros,
             "bookmarks": self.bookmarks,
+            "policy": self.policy,
         }
         try:
-            with open(self.config_file, "w", encoding="utf-8") as config_stream:
-                json.dump(config, config_stream, indent=2, sort_keys=True)
-                config_stream.write("\n")
+            self.atomic_write_json(self.config_file, config)
             return True
         except OSError as err:
-            print("Warning: could not save config:", err)
+            self.emit_error("Warning: could not save config:", err)
             return False
 
+    def persist(self, message, failure_note):
+        """Save the config and tell the truth about whether it stuck."""
+        saved = self.save_config()
+        if saved:
+            self.emit(message)
+        else:
+            self.emit(message + " " + failure_note)
+        return saved
+
+    # ------------------------------------------------------------------
+    # Names and lookup indexes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def normalise_command(name):
+        return str(name).upper()
+
+    def validate_name(self, name, kind="alias"):
+        if not name:
+            return False, "the name is empty"
+        if any(char in self.NAME_FORBIDDEN for char in name):
+            return False, "names cannot contain whitespace, quotes or shell operators"
+        if name[0] in ("!", "?", "-", "/"):
+            return False, "names cannot start with '%s'" % name[0]
+        if self.normalise_command(name) in self.commands:
+            return False, "'%s' is a built-in command; PyCMD does not allow shadowing builtins" % name
+        return True, ""
+
+    def rebuild_indexes(self):
+        self.alias_index = {self.normalise_command(name): name for name in self.aliases}
+        self.macro_index = {self.normalise_command(name): name for name in self.macros}
+        self.bookmark_index = {self.normalise_command(name): name for name in self.bookmarks}
+        self._completion_cache = (None, [])
+
+    def check_command_registry(self):
+        missing_info = sorted(set(self.commands) - set(self.COMMAND_INFO))
+        missing_handler = sorted(set(self.COMMAND_INFO) - set(self.commands))
+        if missing_info:
+            self.emit_error("Internal warning: commands without help entries:", ", ".join(missing_info))
+        if missing_handler:
+            self.emit_error("Internal warning: help entries without handlers:", ", ".join(missing_handler))
+        return not (missing_info or missing_handler)
+
+    def classify_command(self, command):
+        """Resolve a command word the same way execute_line does."""
+        key = self.normalise_command(command)
+        if key in self.alias_index:
+            name = self.alias_index[key]
+            return "alias", name, self.aliases[name]
+        if key in self.macro_index:
+            name = self.macro_index[key]
+            return "macro", name, self.macros[name]
+        if key in self.commands:
+            return "builtin", key, self.commands[key]
+        return "unknown", command, None
+
+    # ------------------------------------------------------------------
+    # Completion
+    # ------------------------------------------------------------------
+
     def complete(self, text, state):
-        options = self.get_suggestions(text)
+        if state == 0 or self._completion_cache[0] != text:
+            self._completion_cache = (text, self.complete_candidates(text))
+        options = self._completion_cache[1]
         if state < len(options):
             return options[state]
         return None
 
+    def complete_candidates(self, text):
+        """Prefix-only completion. Never substitutes a non-matching candidate."""
+        line = ""
+        if readline is not None:
+            try:
+                line = readline.get_line_buffer()[: readline.get_endidx()]
+            except Exception:  # pragma: no cover - backend dependent
+                line = text
+        before = line[: len(line) - len(text)] if text and line.endswith(text) else line
+        first_token = before.strip().split(" ", 1)[0] if before.strip() else ""
+
+        if not first_token:
+            pool = sorted(set(self.commands) | set(self.aliases) | set(self.macros))
+            return [name for name in pool if name.upper().startswith(text.upper())]
+
+        kind = self.command_completers.get(self.normalise_command(first_token), "paths")
+        if text.startswith("-"):
+            return self.complete_flags(first_token, text)
+        if kind == "bookmarks":
+            pool = sorted(self.bookmarks)
+        elif kind == "macros":
+            pool = sorted(self.macros)
+        elif kind == "aliases":
+            pool = sorted(self.aliases)
+        elif kind == "topics":
+            pool = sorted(self.COMMAND_INFO)
+        elif kind == "policy":
+            pool = sorted(DEFAULT_POLICY)
+        elif kind == "directories":
+            return self.get_path_suggestions(text, limit=100, directories_only=True)
+        else:
+            return self.get_path_suggestions(text, limit=100)
+        return [name for name in pool if name.upper().startswith(text.upper())]
+
+    def complete_flags(self, command, text):
+        info = self.COMMAND_INFO.get(self.normalise_command(command))
+        if not info:
+            return []
+        flags = sorted(set(re.findall(r"--[a-z-]+", info[1])))
+        return [flag for flag in flags if flag.startswith(text)]
+
     def get_suggestions(self, text, limit=6):
+        """Fuzzy 'did you mean' suggestions. Also used by SUGGEST."""
         text = text or ""
         candidates = sorted(
             set(self.commands) | set(self.aliases) | set(self.macros) | set(self.bookmarks)
@@ -251,7 +655,7 @@ class CMDEmulator:
                 suggestions.append(match)
         return suggestions[:limit]
 
-    def get_path_suggestions(self, text, limit=6):
+    def get_path_suggestions(self, text, limit=6, directories_only=False):
         if not text:
             return []
 
@@ -272,14 +676,21 @@ class CMDEmulator:
         for name in names:
             if not name.lower().startswith(prefix.lower()):
                 continue
-            display_value = os.path.join(display_directory, name) if display_directory else name
             candidate_path = os.path.join(directory, name)
-            if os.path.isdir(candidate_path):
+            is_directory = os.path.isdir(candidate_path)
+            if directories_only and not is_directory:
+                continue
+            display_value = os.path.join(display_directory, name) if display_directory else name
+            if is_directory:
                 display_value += os.sep
             suggestions.append(display_value)
             if len(suggestions) >= limit:
                 break
         return suggestions
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
 
     def split_input(self, user_input):
         command_line = user_input.strip()
@@ -305,7 +716,7 @@ class CMDEmulator:
             lexer.commenters = ""
             return [self.strip_wrapping_quotes(token) for token in lexer]
         except ValueError as err:
-            print("Input parse error:", err)
+            self.emit_error("Input parse error:", err)
             return arg_string.split()
 
     @staticmethod
@@ -314,34 +725,234 @@ class CMDEmulator:
             return value[1:-1]
         return value
 
-    def print_table(self, rows, headers=None):
-        rows = list(rows)
-        if headers:
-            rows = [headers] + rows
-        if not rows:
-            return
-        widths = [max(len(str(row[index])) for row in rows) for index in range(len(rows[0]))]
-        for row_index, row in enumerate(rows):
-            print("  ".join(str(value).ljust(widths[index]) for index, value in enumerate(row)))
-            if headers and row_index == 0:
-                print("  ".join("-" * width for width in widths))
+    @staticmethod
+    def read_token(text, index):
+        """Read one quote-aware token starting at index. Returns (token, index)."""
+        length = len(text)
+        while index < length and text[index].isspace():
+            index += 1
+        chars = []
+        quote = None
+        while index < length:
+            char = text[index]
+            if quote:
+                if char == quote:
+                    quote = None
+                else:
+                    chars.append(char)
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+                index += 1
+                continue
+            if char.isspace():
+                break
+            chars.append(char)
+            index += 1
+        return "".join(chars), index
 
-    def record_stat(self, command_line, success, duration):
+    def split_first_token(self, text):
+        """Split a raw string into (first token, remainder), honouring quotes."""
+        token, index = self.read_token(text, 0)
+        return token, text[index:].strip()
+
+    def split_operators(self, line, operators=None):
+        """Split a line on shell operators, ignoring anything inside quotes.
+
+        Returns a list of (operator_before_segment, text) pairs. The first
+        segment always carries None. A single '&' stays literal so that
+        filenames such as A&B.txt keep working.
+        """
+        operators = self.OPERATORS if operators is None else operators
+        segments = []
+        pending = []
+        operator = None
+        quote = None
+        index = 0
+        length = len(line)
+
+        while index < length:
+            char = line[index]
+            if quote:
+                pending.append(char)
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+                pending.append(char)
+                index += 1
+                continue
+            matched = None
+            for candidate in operators:
+                if line.startswith(candidate, index):
+                    matched = candidate
+                    break
+            if matched:
+                segments.append((operator, "".join(pending)))
+                pending = []
+                operator = matched
+                index += len(matched)
+                continue
+            pending.append(char)
+            index += 1
+
+        if quote:
+            raise ValueError("unbalanced %s quote" % quote)
+        segments.append((operator, "".join(pending)))
+        return segments
+
+    def split_macro_commands(self, macro_text):
+        try:
+            segments = self.split_operators(macro_text, operators=(";",))
+        except ValueError as err:
+            self.emit_error("Macro parse error:", err)
+            return []
+        return [text.strip() for _, text in segments if text.strip()]
+
+    def parse_redirections(self, text):
+        """Pull >, >>, <, 2> and 2>> out of a stage, leaving the command text."""
+        clean = []
+        redirections = []
+        quote = None
+        index = 0
+        length = len(text)
+
+        while index < length:
+            char = text[index]
+            if quote:
+                clean.append(char)
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+                clean.append(char)
+                index += 1
+                continue
+            if char in (">", "<"):
+                descriptor = 1 if char == ">" else 0
+                if char == ">" and clean and clean[-1] in ("1", "2"):
+                    if len(clean) == 1 or clean[-2].isspace():
+                        descriptor = int(clean.pop())
+                index += 1
+                mode = "w"
+                if char == ">" and index < length and text[index] == ">":
+                    mode = "a"
+                    index += 1
+                target, index = self.read_token(text, index)
+                if not target:
+                    raise ValueError("missing target after '%s'" % char)
+                redirections.append((descriptor, "r" if char == "<" else mode, target))
+                continue
+            clean.append(char)
+            index += 1
+
+        if quote:
+            raise ValueError("unbalanced %s quote" % quote)
+        return "".join(clean).strip(), redirections
+
+    @contextlib.contextmanager
+    def apply_redirections(self, redirections):
+        opened = []
+        saved = (self._stdout, self._stderr, self._pipe_input)
+        try:
+            for descriptor, mode, target in redirections:
+                path = os.path.expanduser(target)
+                if mode == "r":
+                    with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                        self._pipe_input = stream.read()
+                    continue
+                handle = open(path, mode, encoding="utf-8")
+                opened.append(handle)
+                if descriptor == 2:
+                    self._stderr = handle
+                else:
+                    self._stdout = handle
+            yield
+        finally:
+            self._stdout, self._stderr, self._pipe_input = saved
+            for handle in opened:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+    def is_raw_tail(self, command_line):
+        """True for commands whose tail belongs to the OS shell verbatim."""
+        command, _ = self.split_input(command_line)
+        return self.normalise_command(command) in self.RAW_TAIL_COMMANDS
+
+    # ------------------------------------------------------------------
+    # Tables
+    # ------------------------------------------------------------------
+
+    def render_table(self, rows, headers=None, max_width=None, minimum=8):
+        rows = [list(row) for row in rows]
+        if not rows:
+            return []
+        if headers:
+            rows = [list(headers)] + rows
+
+        columns = max(len(row) for row in rows)
+        for row in rows:
+            while len(row) < columns:
+                row.append("")
+
+        widths = [max(len(str(row[index])) for row in rows) for index in range(columns)]
+        if max_width is None:
+            max_width = self.terminal_width()
+
+        def total():
+            return sum(widths) + 2 * (columns - 1)
+
+        while total() > max_width:
+            widest = max(range(columns), key=lambda index: widths[index])
+            if widths[widest] <= minimum:
+                break
+            widths[widest] = max(minimum, widths[widest] - (total() - max_width))
+
+        lines = []
+        for row_index, row in enumerate(rows):
+            cells = []
+            for index, value in enumerate(row):
+                text = str(value)
+                if len(text) > widths[index]:
+                    text = text[: max(1, widths[index] - 1)] + "…"
+                cells.append(text.ljust(widths[index]))
+            lines.append("  ".join(cells).rstrip())
+            if headers and row_index == 0:
+                lines.append("  ".join("-" * width for width in widths).rstrip())
+        return lines
+
+    def print_table(self, rows, headers=None):
+        for line in self.render_table(rows, headers=headers):
+            self.emit(line)
+
+    # ------------------------------------------------------------------
+    # Statistics and on-disk records
+    # ------------------------------------------------------------------
+
+    def record_stat(self, command_line, success, duration, status=None, resolved=None):
         record = {
             "command": command_line,
             "success": success,
+            "status": self.last_status if status is None else status,
             "duration": duration,
             "time": time.strftime("%H:%M:%S"),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "cwd": os.getcwd(),
         }
+        if resolved and resolved != command_line:
+            record["resolved"] = resolved
         self.command_stats.append(record)
-        if len(self.command_stats) > 200:
-            self.command_stats = self.command_stats[-200:]
         self.append_history_record(record)
 
     def append_history_record(self, record):
-        if not self.record_file or self.record_write_failed:
+        if not self.record_file or self.record_write_failed or not self.policy.get("record", True):
             return
         try:
             with open(self.record_file, "a", encoding="utf-8") as record_stream:
@@ -349,185 +960,407 @@ class CMDEmulator:
                 record_stream.write("\n")
         except OSError as err:
             self.record_write_failed = True
-            print("Warning: could not save history record:", err)
+            self.emit_error("Warning: could not save history record:", err)
+            return
+        self.rotate_record_file()
 
-    def load_history_records(self):
+    def rotate_record_file(self):
+        try:
+            if os.path.getsize(self.record_file) <= RECORD_MAX_BYTES:
+                return
+            os.replace(self.record_file, self.record_file + ".1")
+        except OSError as err:
+            self.emit_error("Warning: could not rotate history records:", err)
+
+    def iter_history_records(self, limit=200, window=RECORD_WINDOW_BYTES):
+        """Read only the tail of the record file, so search stays bounded."""
         if not self.record_file or not os.path.exists(self.record_file):
             return []
         records = []
         try:
-            with open(self.record_file, "r", encoding="utf-8") as record_stream:
-                for line in record_stream:
+            size = os.path.getsize(self.record_file)
+            with open(self.record_file, "rb") as record_stream:
+                if size > window:
+                    record_stream.seek(size - window)
+                    record_stream.readline()  # discard the partial first line
+                for raw in record_stream:
                     try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
+                        records.append(json.loads(raw.decode("utf-8", "replace")))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
         except OSError as err:
-            print("Warning: could not read history records:", err)
-        return records
+            self.emit_error("Warning: could not read history records:", err)
+        return records[-limit:]
+
+    def record_file_size(self):
+        try:
+            return os.path.getsize(self.record_file)
+        except (OSError, TypeError):
+            return 0
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def coerce_status(result):
+        """Map a handler's return value onto a process-style status code."""
+        if result is None or result is True:
+            return 0
+        if result is False:
+            return 1
+        try:
+            return int(result)
+        except (TypeError, ValueError):
+            return 0
+
+    def resolve_program(self, command):
+        """Return the executable a bare word names on PATH, or None.
+
+        This is what separates 'findstr' from 'dur': a word that resolves to a
+        real program is not a typo, so it can run directly through argv with no
+        shell involved. A word that resolves to nothing is the dangerous case.
+        """
+        if not command or not self.policy.get("path_programs", True):
+            return None
+        if any(char in command for char in "\"'*?"):
+            return None
+        try:
+            return shutil.which(os.path.expanduser(command))
+        except (OSError, TypeError):
+            return None
+
+    def check_unknown(self, command_line, alias_depth=0, macro_depth=0):
+        """Vet an unrecognised command *before* anything irreversible happens.
+
+        Returns None when the line may proceed, or a status code when it is
+        refused. Running this ahead of redirection is what stops a typo such as
+        'dur > notes.txt' from truncating notes.txt on its way to being refused.
+        """
+        command, _ = self.split_input(command_line)
+        if self.classify_command(command)[0] != "unknown":
+            return None
+        if self.resolve_program(command):
+            return None
+
+        self.emit_error("Command not recognized.")
+        self.print_suggestions(command, to_error=True)
+        if self.authorise_shell(command_line, "fallback", bool(alias_depth or macro_depth)):
+            return None
+        self.emit_error(
+            "Not run. Use !<command>, LEGACY or RUN to reach the OS shell,"
+            " or POLICY shell_fallback always to restore 3.0 behaviour."
+        )
+        return 127
+
+    def authorise_shell(self, command_line, source="fallback", in_expansion=False):
+        if source == "legacy":
+            return bool(self.policy.get("legacy", True))
+        if source == "run":
+            return bool(self.policy.get("run_shell", True))
+
+        mode = self.policy.get("shell_fallback", "confirm")
+        if mode == "always":
+            return True
+        if mode == "off":
+            return False
+        if in_expansion or not self.interactive:
+            return False
+        return self.confirm("Run '%s' through the OS shell? [y/N] " % command_line)
+
+    def run_external(self, command_line, argv=None):
+        """Run an external command, honouring any active capture or redirect."""
+        if not self.diverted and self._pipe_input is None:
+            if argv is not None:
+                return subprocess.run(argv, shell=False).returncode
+            raw = os.system(command_line)
+            if raw and os.name != "nt" and hasattr(os, "waitstatus_to_exitcode"):
+                try:
+                    return os.waitstatus_to_exitcode(raw)
+                except ValueError:
+                    return 1
+            return raw
+
+        completed = subprocess.run(
+            argv if argv is not None else command_line,
+            shell=argv is None,
+            input=self._pipe_input,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.stdout:
+            self.emit(completed.stdout, end="")
+        if completed.stderr:
+            self.emit_error(completed.stderr.rstrip("\n"))
+        return completed.returncode
+
+    def process_input(self, user_input):
+        return self.execute_line(user_input, record_history=True)
+
+    def execute_line(self, user_input, record_history=True, alias_depth=0, macro_depth=0, display_line=None):
+        command_line = user_input.strip()
+        if not command_line:
+            return True
+
+        if record_history:
+            self.history.append(command_line)
+            self._executing_line = command_line
+
+        started = time.perf_counter()
+        try:
+            status = self.run_line(command_line, alias_depth=alias_depth, macro_depth=macro_depth)
+        except KeyboardInterrupt:
+            self.emit_error("Interrupted.")
+            status = 130
+        except Exception as err:
+            self.emit_error("Error executing command:", err)
+            status = 1
+        duration = time.perf_counter() - started
+
+        self.last_status = status
+        if record_history:
+            self.record_stat(display_line or command_line, status == 0, duration, status)
+        return status == 0
+
+    def run_line(self, command_line, alias_depth=0, macro_depth=0):
+        """Split a line into operator-separated groups and run them in order."""
+        if self.policy.get("operators", True) and not self.is_raw_tail(command_line):
+            try:
+                segments = self.split_operators(command_line)
+            except ValueError as err:
+                self.emit_error("Input parse error:", err)
+                return 1
+        else:
+            segments = [(None, command_line)]
+
+        groups = []
+        for operator, text in segments:
+            if operator == "|" and groups:
+                groups[-1][1].append(text)
+            else:
+                groups.append((operator, [text]))
+
+        status = self.last_status
+        for index, (operator, stages) in enumerate(groups):
+            if index:
+                if operator == "&&" and status != 0:
+                    continue
+                if operator == "||" and status == 0:
+                    continue
+            if len(stages) == 1:
+                status = self.run_stage(stages[0], alias_depth, macro_depth)
+            else:
+                status = self.run_pipeline(stages, alias_depth, macro_depth)
+            self.last_status = status
+        return status
+
+    def run_pipeline(self, stages, alias_depth=0, macro_depth=0):
+        data = None
+        status = 0
+        for index, stage in enumerate(stages):
+            if index == len(stages) - 1:
+                saved_input = self._pipe_input
+                self._pipe_input = data
+                try:
+                    status = self.run_stage(stage, alias_depth, macro_depth)
+                finally:
+                    self._pipe_input = saved_input
+                continue
+
+            buffer = io.StringIO()
+            saved_out, saved_input = self._stdout, self._pipe_input
+            self._stdout, self._pipe_input = buffer, data
+            self._capture_depth += 1
+            try:
+                status = self.run_stage(stage, alias_depth, macro_depth)
+            finally:
+                self._capture_depth -= 1
+                self._stdout, self._pipe_input = saved_out, saved_input
+            data = buffer.getvalue()
+        return status
+
+    def run_stage(self, text, alias_depth=0, macro_depth=0):
+        stage_text = text.strip()
+        if not stage_text:
+            self.emit_error("Syntax error: empty command segment.")
+            return 1
+
+        redirections = []
+        if not self.is_raw_tail(stage_text):
+            try:
+                stage_text, redirections = self.parse_redirections(stage_text)
+            except ValueError as err:
+                self.emit_error("Redirection error:", err)
+                return 1
+            if not stage_text:
+                self.emit_error("Syntax error: redirection without a command.")
+                return 1
+
+        # Vet the command before opening any redirection target, so a refused
+        # command never truncates a file on its way to being refused.
+        refusal = self.check_unknown(stage_text, alias_depth, macro_depth)
+        if refusal is not None:
+            return refusal
+
+        if not redirections:
+            return self.dispatch(stage_text, alias_depth, macro_depth)
+
+        try:
+            with self.apply_redirections(redirections):
+                return self.dispatch(stage_text, alias_depth, macro_depth)
+        except OSError as err:
+            self.emit_error("Redirection error:", err)
+            return 1
+
+    def dispatch(self, command_line, alias_depth=0, macro_depth=0):
+        command, arg_string = self.split_input(command_line)
+        args = self.tokenise_args(arg_string)
+        kind, name, payload = self.classify_command(command)
+
+        if kind == "alias":
+            if alias_depth >= self.MAX_EXPANSION_DEPTH:
+                self.emit_error("Alias expansion stopped: possible alias loop.")
+                return 1
+            expanded = payload + (" " + arg_string if arg_string else "")
+            return self.run_line(expanded, alias_depth=alias_depth + 1, macro_depth=macro_depth)
+
+        if kind == "macro":
+            succeeded = self.run_macro(name, args, arg_string, macro_depth=macro_depth, alias_depth=alias_depth)
+            return 0 if succeeded else 1
+
+        if kind == "builtin":
+            return self.coerce_status(payload(args, arg_string))
+
+        # Unknown commands have already been vetted by run_stage.check_unknown.
+        program = self.resolve_program(command)
+        if program:
+            return self.run_external(command_line, argv=[program] + args)
+        return self.run_external(command_line)
+
+    # ------------------------------------------------------------------
+    # Commands: navigation and files
+    # ------------------------------------------------------------------
+
+    def path_operand(self, operands):
+        """Resolve operands into one path, tolerating unquoted spaces."""
+        if not operands:
+            return ""
+        if len(operands) == 1:
+            return operands[0]
+        joined = " ".join(operands)
+        if os.path.exists(os.path.expanduser(joined)):
+            return joined
+        return None
+
+    def expand_globs(self, operands):
+        expanded = []
+        for operand in operands:
+            if any(char in operand for char in "*?["):
+                matches = sorted(glob.glob(os.path.expanduser(operand)), key=str.lower)
+                if matches:
+                    expanded.extend(matches)
+                    continue
+            expanded.append(operand)
+        return expanded
 
     def cmd_cwd(self, args, arg_string=""):
-        if args:
-            dir_path = " ".join(args)
-        else:
-            dir_path = input("Enter directory path: ").strip()
+        operands = [arg for arg in args if arg.lower() not in ("/d", "-d")]
+        if not operands:
+            self.emit_error("Usage: CWD <directory>")
+            return False
+        dir_path = self.path_operand(operands)
+        if dir_path is None:
+            self.emit_error("CWD accepts a single directory; quote paths containing spaces.")
+            return False
         try:
             os.chdir(os.path.expanduser(dir_path))
             self.update_prompt()
             return True
-        except Exception as err:
-            print("Error changing directory:", err)
+        except OSError as err:
+            self.emit_error("Error changing directory:", err)
             return False
 
-    def cmd_cls(self, args, arg_string=""):
-        command = "cls" if platform.system() == "Windows" else "clear"
-        subprocess.call(command, shell=True)
+    def cmd_pwd(self, args, arg_string=""):
+        self.emit("Current Directory:", os.getcwd())
         return True
-
-    def cmd_color(self, args, arg_string=""):
-        if not args:
-            print("Usage: COLOR <code>")
-            return False
-        if platform.system() != "Windows":
-            print("COLOR is only supported by Windows console hosts.")
-            return False
-        code = args[0]
-        try:
-            subprocess.call("color " + code, shell=True)
-            print("Color changed to:", code)
-            return True
-        except Exception as err:
-            print("Error changing color:", err)
-            return False
-
-    def cmd_help(self, args, arg_string=""):
-        if args:
-            command = args[0].upper()
-            info = self.COMMAND_INFO.get(command)
-            if not info:
-                print(f"No help topic for: {args[0]}")
-                self.print_suggestions(args[0])
-                return False
-            category, usage, description = info
-            print(f"{command} ({category})")
-            print("Usage:", usage)
-            print(description)
-            return True
-
-        print(
-            """
-Advanced CMD Emulator Help:
-
-Type COMMANDS to list available commands.
-Type HELP <command> for command-specific help.
-Type SUGGEST <text> to discover similar commands and aliases.
-
-Common commands:
-  CWD <directory>       Change working directory.
-  DIR [path]            List directory contents.
-  TREE [path] [depth]   Show a compact directory tree.
-  RUN <command>         Execute an external command/program.
-  RUN --safe <command>  Execute without shell metacharacter expansion.
-  !<command>            Execute through the OS shell.
-  ALIAS <name> <cmd>    Create a persistent command shortcut.
-  MACRO <name> a; b     Save multiple commands as one workflow.
-  BOOKMARK <name>       Save the current directory for quick jumps.
-  HISTORY search <text> Search command history records.
-  STATS                 Show lightweight session statistics.
-  EXIT                  Exit the emulator.
-
-Notes:
-- Commands are case-insensitive.
-- Type ? RUN for quick command help or ?? for the command list.
-- Alias names keep the spelling you choose.
-- Macros can use {1}, {2}, and {*} placeholders for RUNMACRO arguments.
-- Unknown commands show suggestions before PyCMD tries legacy execution.
-"""
-        )
-        return True
-
-    def cmd_commands(self, args, arg_string=""):
-        grouped = {}
-        for command, (category, usage, description) in self.COMMAND_INFO.items():
-            grouped.setdefault(category, []).append((command, usage, description))
-
-        for category in sorted(grouped):
-            print(f"\n{category}:")
-            rows = [(command, usage, description) for command, usage, description in grouped[category]]
-            self.print_table(rows, headers=("Command", "Usage", "Description"))
-        return True
-
-    def cmd_config(self, args, arg_string=""):
-        print("PyCMD configuration:")
-        print("  User:", getpass.getuser())
-        print("  Python:", sys.version.split()[0])
-        print("  Platform:", platform.platform())
-        print("  Config file:", self.config_file or "disabled")
-        print("  History file:", self.history_file or "disabled")
-        print("  History records:", self.record_file or "disabled")
-        print("  Readline:", "available" if readline is not None else "unavailable")
-        return True
-
-    def cmd_legacy(self, args, arg_string=""):
-        legacy_cmd = arg_string or input("Legacy CMD> ")
-        if not legacy_cmd.strip():
-            print("Usage: LEGACY <command>")
-            return False
-        try:
-            exit_code = os.system(legacy_cmd)
-            return exit_code == 0
-        except Exception as err:
-            print("Error executing legacy command:", err)
-            return False
 
     def cmd_dir(self, args, arg_string=""):
-        target = os.getcwd()
         details = False
+        operands = []
         for arg in args:
             if arg.lower() in ("--details", "/details"):
                 details = True
             else:
-                target = arg
+                operands.append(arg)
 
+        target = os.getcwd()
+        if operands:
+            resolved = self.path_operand(operands)
+            if resolved is None:
+                self.emit_error("DIR accepts a single path; quote paths containing spaces.")
+                return False
+            target = resolved
+
+        target = os.path.expanduser(target)
         try:
-            target = os.path.expanduser(target)
-            items = sorted(os.listdir(target), key=str.lower)
-            if not details:
-                for item in items:
-                    print(item)
-                return True
-
-            rows = []
-            for item in items:
-                item_path = os.path.join(target, item)
-                stat = os.stat(item_path)
-                item_type = "<DIR>" if os.path.isdir(item_path) else "file"
-                size = "" if os.path.isdir(item_path) else str(stat.st_size)
-                modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
-                rows.append((item_type, size, modified, item))
-            self.print_table(rows, headers=("Type", "Size", "Modified", "Name"))
-            return True
-        except Exception as err:
-            print("Error listing directory:", err)
+            if os.path.isdir(target):
+                names = sorted(os.listdir(target), key=str.lower)
+                base = target
+            elif any(char in target for char in "*?["):
+                matches = sorted(glob.glob(target), key=str.lower)
+                if not matches:
+                    self.emit_error("No matches for:", target)
+                    return False
+                base = os.path.dirname(matches[0]) or "."
+                names = [os.path.basename(match) for match in matches]
+            elif os.path.exists(target):
+                base = os.path.dirname(target) or "."
+                names = [os.path.basename(target)]
+            else:
+                self.emit_error("Error listing directory: no such path:", target)
+                return False
+        except OSError as err:
+            self.emit_error("Error listing directory:", err)
             return False
+
+        if not details:
+            for name in names:
+                self.emit(name)
+            return True
+
+        rows = []
+        for name in names:
+            item_path = os.path.join(base, name)
+            try:
+                stat = os.stat(item_path)
+                is_directory = os.path.isdir(item_path)
+                item_type = "<DIR>" if is_directory else "file"
+                size = "" if is_directory else str(stat.st_size)
+                modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
+            except OSError:
+                item_type, size, modified = "?", "?", "?"
+            rows.append((item_type, size, modified, name))
+        self.print_table(rows, headers=("Type", "Size", "Modified", "Name"))
+        return True
 
     def cmd_tree(self, args, arg_string=""):
         target = os.path.expanduser(args[0]) if args else os.getcwd()
         try:
             depth = int(args[1]) if len(args) > 1 else 2
         except ValueError:
-            print("Usage: TREE [path] [depth]")
+            self.emit_error("Usage: TREE [path] [depth]")
             return False
 
         if depth < 0:
-            print("Depth must be 0 or greater.")
+            self.emit_error("Depth must be 0 or greater.")
             return False
         if not os.path.isdir(target):
-            print("Tree path is not a directory:", target)
+            self.emit_error("Tree path is not a directory:", target)
             return False
 
         target = os.path.abspath(target)
-        print(target)
+        self.emit(target)
         self.print_tree(target, depth)
         return True
 
@@ -537,160 +1370,531 @@ Notes:
         try:
             entries = sorted(os.listdir(root), key=str.lower)
         except OSError as err:
-            print(prefix + "Error:", err)
+            self.emit(prefix + "Error: " + str(err))
             return
 
         for index, entry in enumerate(entries):
             path = os.path.join(root, entry)
             is_last = index == len(entries) - 1
             connector = "`-- " if is_last else "|-- "
-            print(prefix + connector + entry)
+            self.emit(prefix + connector + entry)
             if os.path.isdir(path):
                 child_prefix = prefix + ("    " if is_last else "|   ")
                 self.print_tree(path, max_depth, child_prefix, current_depth + 1)
 
     def cmd_mkdir(self, args, arg_string=""):
         if not args:
-            print("Usage: MKDIR <directory_name>")
+            self.emit_error("Usage: MKDIR <directory> [more...]")
             return False
-        dirname = os.path.expanduser(" ".join(args))
-        try:
-            os.makedirs(dirname, exist_ok=False)
-            print(f"Directory '{dirname}' created.")
-            return True
-        except Exception as err:
-            print("Error creating directory:", err)
-            return False
+        succeeded = True
+        for operand in args:
+            dirname = os.path.expanduser(operand)
+            try:
+                os.makedirs(dirname, exist_ok=False)
+                self.emit("Directory '%s' created." % dirname)
+            except OSError as err:
+                self.emit_error("Error creating directory:", err)
+                succeeded = False
+        return succeeded
 
     def cmd_del(self, args, arg_string=""):
-        if not args:
-            print("Usage: DEL [--dry-run] <filename>")
-            return False
-
         dry_run = False
-        file_parts = []
+        force = False
+        operands = []
         for arg in args:
-            if arg.lower() in ("--dry-run", "/dry-run", "-n"):
+            lowered = arg.lower()
+            if lowered in ("--dry-run", "/dry-run", "-n"):
                 dry_run = True
+            elif lowered in ("--force", "/force", "-f"):
+                force = True
             else:
-                file_parts.append(arg)
+                operands.append(arg)
 
-        if not file_parts:
-            print("Usage: DEL [--dry-run] <filename>")
+        if not operands:
+            self.emit_error("Usage: DEL [--dry-run] [--force] <file> [more...]")
             return False
 
-        filename = os.path.expanduser(" ".join(file_parts))
+        if len(operands) > 1:
+            joined = " ".join(operands)
+            if os.path.isfile(os.path.expanduser(joined)):
+                operands = [joined]
+
+        targets = [os.path.expanduser(path) for path in self.expand_globs(operands)]
+
         if dry_run:
-            print(f"Would delete: {filename}")
-            return os.path.isfile(filename)
-
-        try:
-            os.remove(filename)
-            print(f"File '{filename}' deleted.")
+            missing = False
+            for filename in targets:
+                self.emit("Would delete: %s" % filename)
+                if not os.path.isfile(filename):
+                    missing = True
+            if missing:
+                self.emit_error("Some targets are not existing files.")
+                return False
             return True
-        except Exception as err:
-            print("Error deleting file:", err)
-            return False
 
-    def cmd_pwd(self, args, arg_string=""):
-        print("Current Directory:", os.getcwd())
-        return True
+        if len(targets) > 1 and not force:
+            self.emit("About to delete %d files:" % len(targets))
+            for filename in targets:
+                self.emit(" ", filename)
+            if not self.confirm("Delete these %d files? [y/N] " % len(targets)):
+                self.emit_error("Cancelled. Use --force to skip this prompt.")
+                return False
+
+        succeeded = True
+        for filename in targets:
+            try:
+                os.remove(filename)
+                self.emit("File '%s' deleted." % filename)
+            except OSError as err:
+                self.emit_error("Error deleting file:", err)
+                succeeded = False
+        return succeeded
+
+    # ------------------------------------------------------------------
+    # Commands: basics
+    # ------------------------------------------------------------------
+
+    def cmd_cls(self, args, arg_string=""):
+        command = "cls" if platform.system() == "Windows" else "clear"
+        return subprocess.call(command, shell=True) == 0
+
+    def cmd_color(self, args, arg_string=""):
+        if not args:
+            self.emit_error("Usage: COLOR <code>")
+            return False
+        if platform.system() != "Windows":
+            self.emit_error("COLOR is only supported by Windows console hosts.")
+            return False
+        code = args[0]
+        if not re.fullmatch(r"[0-9A-Fa-f]{1,2}", code):
+            self.emit_error("COLOR expects one or two hexadecimal digits, for example 0A.")
+            return False
+        try:
+            if subprocess.call("color " + code, shell=True) != 0:
+                self.emit_error("The console rejected color code:", code)
+                return False
+            self.emit("Color changed to:", code)
+            return True
+        except OSError as err:
+            self.emit_error("Error changing color:", err)
+            return False
 
     def cmd_echo(self, args, arg_string=""):
-        print(arg_string)
+        self.emit(arg_string)
         return True
 
-    def cmd_run(self, args, arg_string=""):
-        if not arg_string.strip():
-            print("Usage: RUN [--safe] <command>")
-            return False
-        if args and args[0].lower() in ("--safe", "/safe"):
-            safe_args = args[1:]
-            if not safe_args:
-                print("Usage: RUN --safe <command>")
-                return False
-            try:
-                completed = subprocess.run(safe_args, shell=False)
-                return completed.returncode == 0
-            except Exception as err:
-                print("Error running safe command:", err)
-                return False
-
-        try:
-            completed = subprocess.run(arg_string, shell=True)
-            return completed.returncode == 0
-        except Exception as err:
-            print("Error running command:", err)
-            return False
-
     def cmd_time(self, args, arg_string=""):
-        print("Current Time:", time.strftime("%H:%M:%S"))
+        self.emit("Current Time:", time.strftime("%H:%M:%S"))
         return True
 
     def cmd_date(self, args, arg_string=""):
-        print("Current Date:", time.strftime("%Y-%m-%d"))
+        self.emit("Current Date:", time.strftime("%Y-%m-%d"))
         return True
+
+    # ------------------------------------------------------------------
+    # Commands: execution
+    # ------------------------------------------------------------------
+
+    def cmd_run(self, args, arg_string=""):
+        if not arg_string.strip():
+            self.emit_error("Usage: RUN [--safe] <command>")
+            return False
+
+        if args and args[0].lower() in ("--safe", "/safe"):
+            safe_args = args[1:]
+            if not safe_args:
+                self.emit_error("Usage: RUN --safe <command>")
+                return False
+            try:
+                status = self.run_external(" ".join(safe_args), argv=safe_args)
+            except OSError as err:
+                self.emit_error("Error running safe command:", err)
+                return False
+            self.last_status = status
+            return status == 0
+
+        if not self.authorise_shell(arg_string, "run"):
+            self.emit_error("RUN's shell mode is disabled by policy; use RUN --safe <program> [args].")
+            return False
+        try:
+            status = self.run_external(arg_string)
+        except OSError as err:
+            self.emit_error("Error running command:", err)
+            return False
+        self.last_status = status
+        return status == 0
+
+    def cmd_legacy(self, args, arg_string=""):
+        legacy_cmd = arg_string.strip()
+        if not legacy_cmd:
+            self.emit_error("Usage: LEGACY <command>")
+            return False
+        if not self.authorise_shell(legacy_cmd, "legacy"):
+            self.emit_error("LEGACY is disabled by policy.")
+            return False
+        try:
+            status = self.run_external(legacy_cmd)
+        except OSError as err:
+            self.emit_error("Error executing legacy command:", err)
+            return False
+        self.last_status = status
+        return status == 0
+
+    def cmd_shell(self, args, arg_string=""):
+        self.emit("Launching external shell...")
+        try:
+            if platform.system() == "Windows":
+                subprocess.Popen("start cmd", shell=True)
+            else:
+                shell = shutil.which("x-terminal-emulator") or shutil.which("xterm")
+                if not shell:
+                    self.emit_error("No terminal emulator found.")
+                    return False
+                subprocess.Popen(shell, shell=True)
+            return True
+        except OSError as err:
+            self.emit_error("Error launching shell:", err)
+            return False
+
+    def cmd_which(self, args, arg_string=""):
+        if len(args) != 1:
+            self.emit_error("Usage: WHICH <program>")
+            return False
+        found = shutil.which(args[0])
+        if found:
+            self.emit(found)
+            return True
+        self.emit_error("Program not found on PATH: %s" % args[0])
+        return False
+
+    # ------------------------------------------------------------------
+    # Commands: help and discovery
+    # ------------------------------------------------------------------
+
+    def cmd_help(self, args, arg_string=""):
+        if args:
+            command = args[0].upper()
+            info = self.COMMAND_INFO.get(command)
+            if not info:
+                self.emit_error("No help topic for: %s" % args[0])
+                self.print_suggestions(args[0], to_error=True)
+                return False
+            category, usage, description = info
+            self.emit("%s (%s)" % (command, category))
+            self.emit("Usage:", usage)
+            self.emit(description)
+            return True
+
+        self.emit("")
+        self.emit("Advanced CMD Emulator Help:")
+        self.emit("")
+        self.emit("Type COMMANDS to list available commands.")
+        self.emit("Type HELP <command> for command-specific help.")
+        self.emit("Type SUGGEST <text> to discover similar commands and aliases.")
+        self.emit("Type EXPLAIN <line> to see exactly how PyCMD will interpret it.")
+        self.emit("")
+        self.emit("Common commands:")
+        rows = []
+        for key in self.FEATURED:
+            info = self.COMMAND_INFO.get(key)
+            if info:
+                rows.append((info[1], info[2]))
+        self.print_table(rows)
+        self.emit("")
+        self.emit("Notes:")
+        for note in (
+            "Commands are case-insensitive, and so are alias, macro and bookmark names.",
+            "Chain commands with && (on success), || (on failure) and ; (always).",
+            "Redirect builtin output with >, >> and 2>, and read a file with <.",
+            "Pipe builtins into programs: DIR --details | findstr .py",
+            "A single & is literal, so filenames such as A&B.txt keep working.",
+            "A word found on PATH runs directly, with no shell in between.",
+            "A word that is neither a builtin nor on PATH is a typo, and is refused.",
+            "Macros can use {1}, {2}, and {*} placeholders for RUNMACRO arguments.",
+        ):
+            self.emit(" -", note)
+        self.emit("")
+        return True
+
+    def cmd_commands(self, args, arg_string=""):
+        grouped = {}
+        for command, (category, usage, description) in self.COMMAND_INFO.items():
+            grouped.setdefault(category, []).append((command, usage, description))
+
+        wanted = args[0].lower() if args else None
+        if wanted:
+            matches = [category for category in grouped if category.lower() == wanted]
+            if not matches:
+                self.emit_error("No such category: %s" % args[0])
+                self.emit_error("Categories:", ", ".join(sorted(grouped)))
+                return False
+            categories = matches
+        else:
+            categories = sorted(grouped)
+
+        for category in categories:
+            self.emit("")
+            self.emit("%s:" % category)
+            rows = sorted(grouped[category], key=lambda item: item[0])
+            self.print_table(rows, headers=("Command", "Usage", "Description"))
+        return True
+
+    def cmd_config(self, args, arg_string=""):
+        self.emit("PyCMD configuration:")
+        self.emit("  Version:", __version__)
+        self.emit("  User:", getpass.getuser())
+        self.emit("  Python:", sys.version.split()[0])
+        self.emit("  Platform:", platform.platform())
+        self.emit("  Interactive:", "yes" if self.interactive else "no")
+        self.emit("  Config file:", self.config_file or "disabled")
+        self.emit("  Config loaded:", "yes" if self.config_loaded else "no (using defaults)")
+        self.emit("  History file:", self.history_file or "disabled")
+        self.emit("  History records:", self.record_file or "disabled")
+        if self.record_file:
+            self.emit("  Record size:", "%.1f KiB" % (self.record_file_size() / 1024.0))
+        self.emit("  Readline:", self.readline_backend or "unavailable")
+        self.emit("  Aliases/macros/bookmarks: %d/%d/%d" % (len(self.aliases), len(self.macros), len(self.bookmarks)))
+        self.emit("  Last status:", self.last_status)
+        return True
+
+    def cmd_suggest(self, args, arg_string=""):
+        text = arg_string or (args[0] if args else "")
+        if not text:
+            self.emit_error("Usage: SUGGEST <text>")
+            return False
+        self.print_suggestions(text)
+        return True
+
+    def print_suggestions(self, text, to_error=False):
+        write = self.emit_error if to_error else self.emit
+        suggestions = self.get_suggestions(text)
+        if suggestions:
+            write("Did you mean: " + ", ".join(suggestions))
+        else:
+            write("No close PyCMD command or alias found.")
+
+    def cmd_explain(self, args, arg_string=""):
+        if not arg_string.strip():
+            self.emit_error("Usage: EXPLAIN <command line>")
+            return False
+
+        line = arg_string.strip()
+        rows = []
+        reaches_shell = False
+
+        if self.policy.get("operators", True) and not self.is_raw_tail(line):
+            try:
+                segments = self.split_operators(line)
+            except ValueError as err:
+                self.emit_error("Input parse error:", err)
+                return False
+        else:
+            segments = [(None, line)]
+
+        for operator, text in segments:
+            stage = text.strip()
+            if not stage:
+                rows.append((operator or "run", "syntax error", "empty command segment"))
+                continue
+            label = {None: "run", "&&": "on success", "||": "on failure", ";": "then", "|": "pipe into"}.get(
+                operator, operator or "run"
+            )
+            redirections = []
+            if not self.is_raw_tail(stage):
+                try:
+                    stage, redirections = self.parse_redirections(stage)
+                except ValueError as err:
+                    rows.append((label, "syntax error", str(err)))
+                    continue
+            for descriptor, mode, target in redirections:
+                verb = {"r": "reads from", "w": "writes to", "a": "appends to"}[mode]
+                stream = {0: "stdin", 1: "stdout", 2: "stderr"}.get(descriptor, "fd%d" % descriptor)
+                rows.append((label, "%s %s" % (stream, verb), target))
+            shell_step = self.explain_chain(stage, rows, label)
+            reaches_shell = reaches_shell or shell_step
+
+        self.print_table(rows, headers=("When", "Resolves as", "Detail"))
+        if reaches_shell:
+            mode = self.policy.get("shell_fallback", "confirm")
+            self.emit("")
+            self.emit_error(
+                "Warning: this line contains a command PyCMD does not know."
+                " With shell_fallback=%s it would %s."
+                % (mode, {"off": "be refused", "confirm": "ask first", "always": "run in the OS shell"}[mode])
+            )
+        return True
+
+    def explain_chain(self, stage, rows, label, depth=0):
+        command, arg_string = self.split_input(stage)
+        kind, name, payload = self.classify_command(command)
+        indent = "  " * depth
+
+        if kind == "alias":
+            rows.append((label if not depth else "", indent + "alias " + name, payload))
+            if depth >= self.MAX_EXPANSION_DEPTH:
+                rows.append(("", indent + "  stopped", "possible alias loop"))
+                return False
+            expanded = payload + (" " + arg_string if arg_string else "")
+            return self.explain_chain(expanded, rows, label, depth + 1)
+
+        if kind == "macro":
+            rows.append((label if not depth else "", indent + "macro " + name, payload))
+            reaches_shell = False
+            for step in self.split_macro_commands(payload):
+                reaches_shell = self.explain_chain(step, rows, "", depth + 1) or reaches_shell
+            return reaches_shell
+
+        if kind == "builtin":
+            category, usage, _ = self.COMMAND_INFO.get(name, ("", name, ""))
+            rows.append((label if not depth else "", indent + "builtin " + name, usage))
+            return False
+
+        program = self.resolve_program(command)
+        if program:
+            rows.append((label if not depth else "", indent + "program " + command, program))
+            return False
+
+        rows.append((label if not depth else "", indent + "UNKNOWN " + command, "not a builtin and not on PATH"))
+        return True
+
+    def cmd_policy(self, args, arg_string=""):
+        if not args:
+            rows = [(key, str(self.policy.get(key, default))) for key, default in sorted(DEFAULT_POLICY.items())]
+            self.print_table(rows, headers=("Setting", "Value"))
+            self.emit("")
+            self.emit("shell_fallback: off | confirm | always — what happens to an unknown command.")
+            self.emit("Change with: POLICY <setting> <value>")
+            return True
+
+        if len(args) != 2:
+            self.emit_error("Usage: POLICY [key value]")
+            return False
+
+        key, value = args[0].lower(), args[1]
+        if key not in DEFAULT_POLICY:
+            self.emit_error("No such policy setting: %s" % args[0])
+            self.emit_error("Known settings:", ", ".join(sorted(DEFAULT_POLICY)))
+            return False
+
+        default = DEFAULT_POLICY[key]
+        if isinstance(default, bool):
+            lowered = value.strip().lower()
+            if lowered not in TRUE_WORDS + FALSE_WORDS:
+                self.emit_error("Expected on/off for %s." % key)
+                return False
+            self.policy[key] = lowered in TRUE_WORDS
+        else:
+            choices = POLICY_CHOICES.get(key, ())
+            if value.strip().lower() not in choices:
+                self.emit_error("Expected one of %s for %s." % (", ".join(choices), key))
+                return False
+            self.policy[key] = value.strip().lower()
+
+        return self.persist(
+            "Policy updated: %s -> %s" % (key, self.policy[key]),
+            "(not persisted)",
+        )
+
+    def cmd_record(self, args, arg_string=""):
+        if not args:
+            state = "on" if self.policy.get("record", True) else "off"
+            self.emit("Command recording:", state)
+            self.emit("  File:", self.record_file or "disabled")
+            self.emit("  Size: %.1f KiB" % (self.record_file_size() / 1024.0))
+            self.emit("  Note: every command line you type is stored here.")
+            return True
+
+        value = args[0].strip().lower()
+        if value not in TRUE_WORDS + FALSE_WORDS:
+            self.emit_error("Usage: RECORD [on|off]")
+            return False
+        self.policy["record"] = value in TRUE_WORDS
+        return self.persist(
+            "Command recording %s." % ("enabled" if self.policy["record"] else "disabled"),
+            "(not persisted)",
+        )
+
+    # ------------------------------------------------------------------
+    # Commands: history and stats
+    # ------------------------------------------------------------------
 
     def cmd_history(self, args, arg_string=""):
         if args and args[0].lower() in ("--clear", "/clear"):
             self.history.clear()
-            print("Session history cleared.")
+            if self.record_file and os.path.exists(self.record_file):
+                self.emit(
+                    "Session history cleared (on-disk records kept at %s; use HISTORY --purge to delete them)."
+                    % self.record_file
+                )
+            else:
+                self.emit("Session history cleared.")
             return True
+
+        if args and args[0].lower() in ("--purge", "/purge"):
+            return self.purge_history_records()
 
         if args and args[0].lower() in ("search", "find"):
             query = " ".join(args[1:]).strip()
             if not query:
-                print("Usage: HISTORY search <text>")
+                self.emit_error("Usage: HISTORY search <text>")
                 return False
             return self.search_history(query)
 
         if args and args[0].lower() == "last":
-            if len(args) == 1:
-                limit = 10
-            else:
+            limit = 10
+            if len(args) > 1:
                 try:
                     limit = int(args[1])
                 except ValueError:
-                    print("Usage: HISTORY last [limit]")
+                    self.emit_error("Usage: HISTORY last [limit]")
                     return False
-            return self.print_history_entries(self.history[-limit:])
+            if limit < 1:
+                self.emit_error("HISTORY last needs a limit of 1 or more.")
+                return False
+            return self.print_history_entries(self.history[-limit:], len(self.history) - min(limit, len(self.history)) + 1)
 
         limit = None
         if args:
             try:
                 limit = int(args[0])
             except ValueError:
-                print("Usage: HISTORY [limit|last n|search text|--clear]")
+                self.emit_error("Usage: HISTORY [limit|last n|search text|--clear|--purge]")
+                return False
+            if limit < 1:
+                self.emit_error("HISTORY needs a limit of 1 or more.")
                 return False
 
-        entries = self.history[-limit:] if limit else self.history
-        return self.print_history_entries(entries)
+        entries = self.history if limit is None else self.history[-limit:]
+        return self.print_history_entries(entries, len(self.history) - len(entries) + 1)
 
-    def print_history_entries(self, entries):
+    def print_history_entries(self, entries, start=1):
         if entries:
-            print("Command History:")
-            start = len(self.history) - len(entries) + 1
+            self.emit("Command History:")
             for index, command in enumerate(entries, start=start):
-                print(f"{index}: {command}")
+                self.emit("%d: %s" % (index, command))
         else:
-            print("No commands in history.")
+            self.emit("No commands in history.")
         return True
 
     def search_history(self, query):
         query_lower = query.lower()
+        session = self.history
+        if session and self._executing_line and session[-1] == self._executing_line:
+            session = session[:-1]
+
         session_matches = [
             {"source": "session", "time": "", "cwd": "", "command": command}
-            for command in self.history
+            for command in session
             if query_lower in command.lower()
         ]
         record_matches = [
-            {"source": "record", **record}
-            for record in self.load_history_records()
+            dict(record, source="record")
+            for record in self.iter_history_records()
             if query_lower in str(record.get("command", "")).lower()
         ]
-        matches = (session_matches + record_matches)[-20:]
+        matches = session_matches[-10:] + record_matches[-10:]
         if not matches:
-            print(f"No history matches for: {query}")
+            self.emit("No history matches for: %s" % query)
             return True
 
         rows = [
@@ -705,348 +1909,406 @@ Notes:
         self.print_table(rows, headers=("Source", "Time", "Cwd", "Command"))
         return True
 
+    def purge_history_records(self):
+        if not self.record_file or not os.path.exists(self.record_file):
+            self.emit("No on-disk history records to purge.")
+            return True
+        size = self.record_file_size()
+        self.emit("Records file: %s (%.1f KiB)" % (self.record_file, size / 1024.0))
+        if not self.confirm("Delete the on-disk command records? [y/N] "):
+            self.emit_error("Cancelled; records kept.")
+            return False
+        try:
+            os.remove(self.record_file)
+        except OSError as err:
+            self.emit_error("Could not delete records:", err)
+            return False
+        self.emit("On-disk command records deleted.")
+        return True
+
     def cmd_stats(self, args, arg_string=""):
         if not self.command_stats:
-            print("No commands have been executed yet.")
+            self.emit("No commands have been executed yet.")
             return True
 
-        total = len(self.command_stats)
-        failures = sum(1 for item in self.command_stats if not item["success"])
-        average = sum(item["duration"] for item in self.command_stats) / total
-        print("Session stats:")
-        print("  Commands:", total)
-        print("  Failures:", failures)
-        print("  Average duration:", f"{average:.3f}s")
+        stats = list(self.command_stats)
+        total = len(stats)
+        failures = sum(1 for item in stats if not item["success"])
+        average = sum(item["duration"] for item in stats) / total
+        self.emit("Session stats:")
+        self.emit("  Commands:", total)
+        self.emit("  Failures:", failures)
+        self.emit("  Average duration:", "%.3fs" % average)
 
-        slowest = sorted(self.command_stats, key=lambda item: item["duration"], reverse=True)[:5]
-        print("\nSlowest commands:")
+        slowest = sorted(stats, key=lambda item: item["duration"], reverse=True)[:5]
+        self.emit("")
+        self.emit("Slowest commands:")
         rows = [
-            (item["time"], f"{item['duration']:.3f}s", "ok" if item["success"] else "failed", item["command"])
+            (
+                item["time"],
+                "%.3fs" % item["duration"],
+                "ok" if item["success"] else "failed",
+                item["command"],
+            )
             for item in slowest
         ]
         self.print_table(rows, headers=("Time", "Duration", "Result", "Command"))
         return True
 
-    def cmd_suggest(self, args, arg_string=""):
-        text = arg_string or (args[0] if args else "")
-        if not text:
-            print("Usage: SUGGEST <text>")
-            return False
-        self.print_suggestions(text)
-        return True
-
-    def print_suggestions(self, text):
-        suggestions = self.get_suggestions(text)
-        if suggestions:
-            print("Did you mean:", ", ".join(suggestions))
-        else:
-            print("No close PyCMD command or alias found.")
+    # ------------------------------------------------------------------
+    # Commands: aliases, macros, bookmarks
+    # ------------------------------------------------------------------
 
     def cmd_alias(self, args, arg_string=""):
-        if len(args) < 2:
-            print("Usage: ALIAS <name> <command>")
+        name, command = self.split_first_token(arg_string)
+        if not name or not command:
+            self.emit_error("Usage: ALIAS <name> <command>")
             return False
-        name = args[0]
-        command_start = arg_string.find(name) + len(name)
-        command = arg_string[command_start:].strip()
-        if not command:
-            print("Usage: ALIAS <name> <command>")
+        ok, reason = self.validate_name(name, "alias")
+        if not ok:
+            self.emit_error("Cannot create alias '%s': %s" % (name, reason))
             return False
         self.aliases[name] = command
-        self.save_config()
-        print(f"Alias created: {name} -> {command}")
-        return True
+        self.rebuild_indexes()
+        return self.persist("Alias created: %s -> %s" % (name, command), "(not persisted)")
 
     def cmd_unalias(self, args, arg_string=""):
         if len(args) != 1:
-            print("Usage: UNALIAS <name>")
+            self.emit_error("Usage: UNALIAS <name>")
             return False
-        name = args[0]
-        if name in self.aliases:
-            del self.aliases[name]
-            self.save_config()
-            print(f"Alias '{name}' removed.")
-            return True
-        print(f"No such alias: {name}")
-        return False
+        key = self.normalise_command(args[0])
+        name = self.alias_index.get(key)
+        if name is None:
+            self.emit_error("No such alias: %s" % args[0])
+            return False
+        del self.aliases[name]
+        self.rebuild_indexes()
+        return self.persist("Alias '%s' removed." % name, "(not persisted)")
 
     def cmd_listaliases(self, args, arg_string=""):
         if self.aliases:
             rows = sorted((name, command) for name, command in self.aliases.items())
             self.print_table(rows, headers=("Alias", "Command"))
         else:
-            print("No aliases defined.")
+            self.emit("No aliases defined.")
         return True
 
     def cmd_macro(self, args, arg_string=""):
-        if len(args) < 2:
-            print("Usage: MACRO <name> <command>; <command>")
+        name, macro_text = self.split_first_token(arg_string)
+        if not name or not macro_text:
+            self.emit_error("Usage: MACRO <name> <command>; <command>")
             return False
-
-        name = args[0]
-        macro_start = arg_string.find(name) + len(name)
-        macro_text = arg_string[macro_start:].strip()
+        ok, reason = self.validate_name(name, "macro")
+        if not ok:
+            self.emit_error("Cannot create macro '%s': %s" % (name, reason))
+            return False
         commands = self.split_macro_commands(macro_text)
         if not commands:
-            print("Usage: MACRO <name> <command>; <command>")
+            self.emit_error("Usage: MACRO <name> <command>; <command>")
             return False
-
         self.macros[name] = macro_text
-        self.save_config()
-        print(f"Macro saved: {name} ({len(commands)} command(s))")
-        return True
+        self.rebuild_indexes()
+        return self.persist("Macro saved: %s (%d command(s))" % (name, len(commands)), "(not persisted)")
 
     def cmd_runmacro(self, args, arg_string=""):
-        if not args:
-            print("Usage: RUNMACRO <name> [args]")
-            return False
+        dry_run = False
+        stop_on_error = None
+        remainder = arg_string
+        while True:
+            token, rest = self.split_first_token(remainder)
+            lowered = token.lower()
+            if lowered in ("--dry-run", "/dry-run", "-n"):
+                dry_run = True
+                remainder = rest
+                continue
+            if lowered in ("--stop", "/stop"):
+                stop_on_error = True
+                remainder = rest
+                continue
+            break
 
-        name = args[0]
-        extra_start = arg_string.find(name) + len(name)
-        extra_string = arg_string[extra_start:].strip()
-        return self.run_macro(name, args[1:], extra_string)
+        name, extra_string = self.split_first_token(remainder)
+        if not name:
+            self.emit_error("Usage: RUNMACRO [--dry-run] [--stop] <name> [args]")
+            return False
+        extra_args = self.tokenise_args(extra_string)
+        return self.run_macro(name, extra_args, extra_string, dry_run=dry_run, stop_on_error=stop_on_error)
 
     def cmd_unmacro(self, args, arg_string=""):
         if len(args) != 1:
-            print("Usage: UNMACRO <name>")
+            self.emit_error("Usage: UNMACRO <name>")
             return False
-        name = args[0]
-        if name in self.macros:
-            del self.macros[name]
-            self.save_config()
-            print(f"Macro '{name}' removed.")
-            return True
-        print(f"No such macro: {name}")
-        return False
+        key = self.normalise_command(args[0])
+        name = self.macro_index.get(key)
+        if name is None:
+            self.emit_error("No such macro: %s" % args[0])
+            return False
+        del self.macros[name]
+        self.rebuild_indexes()
+        return self.persist("Macro '%s' removed." % name, "(not persisted)")
 
     def cmd_listmacros(self, args, arg_string=""):
         if self.macros:
             rows = sorted((name, command) for name, command in self.macros.items())
             self.print_table(rows, headers=("Macro", "Commands"))
         else:
-            print("No macros defined.")
+            self.emit("No macros defined.")
         return True
 
-    def split_macro_commands(self, macro_text):
-        commands = []
-        current = []
-        quote = None
-
-        for char in macro_text:
-            if char in ("'", '"'):
-                quote = None if quote == char else char if quote is None else quote
-                current.append(char)
-                continue
-            if char == ";" and quote is None:
-                command = "".join(current).strip()
-                if command:
-                    commands.append(command)
-                current = []
-                continue
-            current.append(char)
-
-        command = "".join(current).strip()
-        if command:
-            commands.append(command)
-        return commands
-
     def expand_macro_command(self, command, args, arg_string):
-        expanded = command.replace("{*}", arg_string)
-        for index, value in enumerate(args, start=1):
-            expanded = expanded.replace("{" + str(index) + "}", value)
-        return expanded
+        """Substitute {1}, {2} and {*} in a single pass, never rescanning."""
 
-    def run_macro(self, name, args=None, arg_string="", macro_depth=0):
+        def replace(match):
+            token = match.group(1)
+            if token == "*":
+                return arg_string
+            index = int(token)
+            if 1 <= index <= len(args):
+                return args[index - 1]
+            return match.group(0)
+
+        return re.sub(r"\{(\*|\d+)\}", replace, command)
+
+    def run_macro(self, name, args=None, arg_string="", macro_depth=0, alias_depth=0, dry_run=False, stop_on_error=None):
         args = args or []
-        if macro_depth >= 10:
-            print("Macro expansion stopped: possible macro loop.")
+        if max(macro_depth, self._macro_depth) >= self.MAX_EXPANSION_DEPTH:
+            self.emit_error("Macro expansion stopped: possible macro loop.")
             return False
 
-        macro_text = self.macros.get(name)
+        key = self.normalise_command(name)
+        resolved = self.macro_index.get(key)
+        macro_text = self.macros.get(resolved) if resolved else None
         if not macro_text:
-            print(f"No such macro: {name}")
-            self.print_suggestions(name)
+            self.emit_error("No such macro: %s" % name)
+            self.print_suggestions(name, to_error=True)
             return False
+
+        if stop_on_error is None:
+            stop_on_error = bool(self.policy.get("stop_on_error", False))
 
         success = True
-        for command in self.split_macro_commands(macro_text):
-            expanded = self.expand_macro_command(command, args, arg_string)
-            print(">>", expanded)
-            success = self.execute_line(
-                expanded,
-                record_history=False,
-                macro_depth=macro_depth + 1,
-            ) and success
+        self._macro_depth += 1
+        try:
+            for command in self.split_macro_commands(macro_text):
+                expanded = self.expand_macro_command(command, args, arg_string)
+                self.emit(">>", expanded)
+                if dry_run:
+                    continue
+                step_ok = self.execute_line(
+                    expanded,
+                    record_history=False,
+                    alias_depth=alias_depth,
+                    macro_depth=self._macro_depth,
+                )
+                success = step_ok and success
+                if not self.running:
+                    break
+                if stop_on_error and not step_ok:
+                    self.emit_error("Macro stopped after a failing command.")
+                    break
+        finally:
+            self._macro_depth -= 1
         return success
 
     def cmd_bookmark(self, args, arg_string=""):
-        if not args:
-            print("Usage: BOOKMARK <name> [path]")
+        name, rest = self.split_first_token(arg_string)
+        if not name:
+            self.emit_error("Usage: BOOKMARK <name> [path]")
             return False
-        name = args[0]
-        path = os.path.expanduser(" ".join(args[1:])) if len(args) > 1 else os.getcwd()
+        ok, reason = self.validate_name(name, "bookmark")
+        if not ok:
+            self.emit_error("Cannot create bookmark '%s': %s" % (name, reason))
+            return False
+        path = os.path.expanduser(self.strip_wrapping_quotes(rest)) if rest else os.getcwd()
         path = os.path.abspath(path)
         if not os.path.isdir(path):
-            print("Bookmark path is not a directory:", path)
+            self.emit_error("Bookmark path is not a directory: %s" % path)
             return False
         self.bookmarks[name] = path
-        self.save_config()
-        print(f"Bookmark saved: {name} -> {path}")
-        return True
+        self.rebuild_indexes()
+        return self.persist("Bookmark saved: %s -> %s" % (name, path), "(not persisted)")
 
     def cmd_jump(self, args, arg_string=""):
         if len(args) != 1:
-            print("Usage: JUMP <name>")
+            self.emit_error("Usage: JUMP <name>")
             return False
-        name = args[0]
-        path = self.bookmarks.get(name)
+        key = self.normalise_command(args[0])
+        name = self.bookmark_index.get(key)
+        path = self.bookmarks.get(name) if name else None
         if not path:
-            print(f"No such bookmark: {name}")
-            self.print_suggestions(name)
+            self.emit_error("No such bookmark: %s" % args[0])
+            self.print_suggestions(args[0], to_error=True)
             return False
         try:
             os.chdir(path)
             self.update_prompt()
-            print("Current Directory:", os.getcwd())
+            self.emit("Current Directory:", os.getcwd())
             return True
-        except Exception as err:
-            print("Error changing directory:", err)
+        except OSError as err:
+            self.emit_error("Error changing directory:", err)
             return False
 
     def cmd_unbookmark(self, args, arg_string=""):
         if len(args) != 1:
-            print("Usage: UNBOOKMARK <name>")
+            self.emit_error("Usage: UNBOOKMARK <name>")
             return False
-        name = args[0]
-        if name in self.bookmarks:
-            del self.bookmarks[name]
-            self.save_config()
-            print(f"Bookmark '{name}' removed.")
-            return True
-        print(f"No such bookmark: {name}")
-        return False
+        key = self.normalise_command(args[0])
+        name = self.bookmark_index.get(key)
+        if name is None:
+            self.emit_error("No such bookmark: %s" % args[0])
+            return False
+        del self.bookmarks[name]
+        self.rebuild_indexes()
+        return self.persist("Bookmark '%s' removed." % name, "(not persisted)")
 
     def cmd_listbookmarks(self, args, arg_string=""):
         if self.bookmarks:
             rows = sorted((name, path) for name, path in self.bookmarks.items())
             self.print_table(rows, headers=("Bookmark", "Path"))
         else:
-            print("No bookmarks defined.")
+            self.emit("No bookmarks defined.")
         return True
 
-    def cmd_shell(self, args, arg_string=""):
-        print("Launching external shell...")
-        try:
-            if platform.system() == "Windows":
-                subprocess.Popen("start cmd", shell=True)
-            else:
-                shell = shutil.which("x-terminal-emulator") or shutil.which("xterm")
-                if not shell:
-                    print("No terminal emulator found.")
-                    return False
-                subprocess.Popen(shell, shell=True)
-            return True
-        except Exception as err:
-            print("Error launching shell:", err)
-            return False
-
-    def cmd_which(self, args, arg_string=""):
-        if len(args) != 1:
-            print("Usage: WHICH <program>")
-            return False
-        found = shutil.which(args[0])
-        if found:
-            print(found)
-            return True
-        print(f"Program not found on PATH: {args[0]}")
-        return False
+    # ------------------------------------------------------------------
+    # Commands: session
+    # ------------------------------------------------------------------
 
     def cmd_restart(self, args, arg_string=""):
-        print("Restarting CMD Emulator...")
-        python = sys.executable
-        os.execl(python, python, *sys.argv)
+        self.emit("Restarting CMD Emulator...")
+        try:
+            self.out.flush()
+        except (AttributeError, ValueError, OSError):
+            pass
+        self.save_readline_history()
+        self.save_config()
+        try:
+            os.execl(sys.executable, sys.executable, SCRIPT_PATH, *LAUNCH_ARGV)
+        except OSError as err:
+            self.emit_error("Restart failed:", err)
+            return False
 
     def cmd_exit(self, args, arg_string=""):
-        print("Exiting CMD Emulator.")
+        self.emit("Exiting CMD Emulator.")
         self.running = False
         return True
 
-    def process_input(self, user_input):
-        self.execute_line(user_input, record_history=True)
+    # ------------------------------------------------------------------
+    # Session drivers
+    # ------------------------------------------------------------------
 
-    def execute_line(self, user_input, record_history=True, alias_depth=0, macro_depth=0):
-        command_line = user_input.strip()
-        if not command_line:
-            return True
-
-        if record_history:
-            self.history.append(command_line)
-            if readline is not None:
-                readline.add_history(command_line)
-
-        command, arg_string = self.split_input(command_line)
-        args = self.tokenise_args(arg_string)
-
-        if command in self.aliases:
-            if alias_depth >= 10:
-                print("Alias expansion stopped: possible alias loop.")
-                self.record_stat(command_line, False, 0)
-                return False
-            expanded = self.aliases[command]
-            if arg_string:
-                expanded = expanded + " " + arg_string
-            return self.execute_line(
-                expanded,
-                record_history=False,
-                alias_depth=alias_depth + 1,
-                macro_depth=macro_depth,
-            )
-
-        if command in self.macros:
-            return self.run_macro(command, args, arg_string, macro_depth=macro_depth)
-
-        command_key = command.upper()
-        started = time.perf_counter()
-        success = False
+    def run_script(self, path):
         try:
-            if command_key in self.commands:
-                result = self.commands[command_key](args, arg_string)
-                success = result is not False
-            else:
-                print("Command not recognized.")
-                self.print_suggestions(command)
-                print("Trying legacy mode...")
-                success = os.system(command_line) == 0
-        except Exception as err:
-            print("Error executing command:", err)
-            success = False
+            with open(path, "r", encoding="utf-8-sig") as script:
+                lines = script.readlines()
+        except OSError as err:
+            self.emit_error("Could not read script:", err)
+            return 1
 
-        duration = time.perf_counter() - started
-        self.record_stat(command_line, success, duration)
-        return success
+        status = 0
+        for number, raw in enumerate(lines, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#") or line[:4].upper() == "REM ":
+                continue
+            if not self.execute_line(line, record_history=False):
+                status = self.last_status or 1
+                self.emit_error("Script %s failed at line %d: %s" % (path, number, line))
+                if self.policy.get("stop_on_error", False):
+                    return status
+            if not self.running:
+                break
+        return status
 
     def run(self):
-        print("Welcome to the Advanced CMD Emulator")
-        print("For help, type HELP or _HELP")
-        print("By Jared (C)03/2019 - Enhanced 2026")
-        time.sleep(1)
+        if self.show_banner:
+            self.emit("Welcome to the Advanced CMD Emulator")
+            self.emit("PyCMD %s - type HELP, COMMANDS, or EXPLAIN <line>" % __version__)
+            self.emit("By Jared (C)03/2019 - Enhanced 2026")
+            if readline is None:
+                self.emit_error(
+                    "Note: readline is unavailable, so TAB completion and line editing are off."
+                    " On Windows, 'pip install pyreadline3' enables them."
+                )
         self.update_prompt()
 
+        consecutive_errors = 0
         while self.running:
             try:
                 user_input = input(self.prompt)
-                self.process_input(user_input)
-                self.update_prompt()
+            except EOFError:
+                self.emit("")
+                self.running = False
+                break
             except KeyboardInterrupt:
-                print("\nKeyboardInterrupt detected. Type EXIT to quit.")
+                self.emit("")
+                self.emit_error("KeyboardInterrupt detected. Type EXIT to quit.")
+                continue
+
+            try:
+                self.process_input(user_input)
+                consecutive_errors = 0
+            except KeyboardInterrupt:
+                self.emit_error("Interrupted.")
             except Exception as err:
-                print("An error occurred:", err)
+                self.emit_error("An error occurred:", err)
+                consecutive_errors += 1
+                if consecutive_errors >= 10:
+                    self.emit_error("Too many consecutive errors; exiting.")
+                    self.running = False
+            self.update_prompt()
+        return self.last_status
 
 
-def main():
-    emulator = CMDEmulator()
-    emulator.run()
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="pycmd",
+        description="PyCMD %s - a small, predictable CMD-style shell in Python." % __version__,
+    )
+    parser.add_argument("script", nargs="?", help="run a file of PyCMD commands, then exit")
+    parser.add_argument("-c", "--command", action="append", metavar="LINE", help="run a command line, then exit (repeatable)")
+    parser.add_argument("--safe-mode", action="store_true", help="disable every route to the OS shell")
+    parser.add_argument("--config", metavar="PATH", help="use an alternative config file")
+    parser.add_argument("--no-config", action="store_true", help="do not read or write any config file")
+    parser.add_argument("--no-record", action="store_true", help="do not write on-disk command records")
+    parser.add_argument("--no-banner", action="store_true", help="skip the startup banner")
+    parser.add_argument("--version", action="version", version="PyCMD " + __version__)
+    return parser
+
+
+def main(argv=None):
+    options = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+
+    one_shot = bool(options.command) or bool(options.script)
+    config_file = None if options.no_config else (options.config or CONFIG_FILE)
+
+    emulator = CMDEmulator(
+        config_file=config_file,
+        record_file=None if options.no_record else RECORD_FILE,
+        history_file=None if one_shot else HISTORY_FILE,
+        auto_persist_history=not one_shot,
+        interactive=False if one_shot else None,
+        show_banner=not (options.no_banner or one_shot),
+    )
+
+    if options.safe_mode:
+        emulator.policy.update({"shell_fallback": "off", "legacy": False, "run_shell": False})
+    elif one_shot:
+        # A typo in a script must never become a shell command with nobody watching.
+        emulator.policy["shell_fallback"] = "off"
+
+    status = 0
+    if options.command:
+        for line in options.command:
+            emulator.execute_line(line, record_history=False)
+            status = emulator.last_status
+            if not emulator.running:
+                break
+    if options.script and emulator.running:
+        status = emulator.run_script(options.script) or status
+    if not one_shot:
+        status = emulator.run()
+
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

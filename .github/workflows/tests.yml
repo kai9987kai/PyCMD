@@ -1,0 +1,62 @@
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: PyCMD has no third-party imports
+        shell: python
+        run: |
+          import re, sys
+          if not hasattr(sys, "stdlib_module_names"):
+              print("skipped: needs Python 3.10+")
+              raise SystemExit(0)
+          source = open("PythonCMD.py", encoding="utf-8").read()
+          extra = [m for m in re.findall(r"^\s*import (\w+)", source, re.M)
+                   if m not in sys.stdlib_module_names]
+          assert not extra, "non-stdlib imports: %s" % extra
+
+      - name: One-shot mode exits cleanly
+        run: python PythonCMD.py --no-config --no-record -c "ECHO ci"
+
+      - name: A typo is refused rather than run
+        shell: python
+        run: |
+          import subprocess, sys
+          done = subprocess.run(
+              [sys.executable, "PythonCMD.py", "--no-config", "--no-record",
+               "-c", "definitelynotacommand"],
+              capture_output=True, text=True, timeout=60)
+          assert done.returncode != 0, done
+          assert "Not run." in done.stderr, done.stderr
+
+      - name: EOF on stdin terminates the REPL
+        shell: python
+        run: |
+          import subprocess, sys
+          done = subprocess.run(
+              [sys.executable, "PythonCMD.py", "--no-config", "--no-record"],
+              input="ECHO alive\n", capture_output=True, text=True, timeout=60)
+          assert done.returncode == 0, done
+          assert len(done.stdout.splitlines()) < 100, "REPL spun on EOF"
