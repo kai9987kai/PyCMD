@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Advanced CMD Emulator for Windows [Version 4.0 - Enhanced 2026]
-By Jared (C)03/2019 - Enhanced 2026
+By Jared/kai9987kai (C)03/2019 - Enhanced 2026
 Contribution credits
 kai9987kai
 
@@ -12,7 +12,7 @@ pipes that work for PyCMD's own builtins, persistent aliases, macros and
 bookmarks, and a non-interactive mode so the shell can be scripted.
 
 For best functionality, run this on the Python command line.
-Visit my GitHub: http://www.github.com/Jared-dareJ/
+Visit the GitHub: http://www.github.com/Kai9987kai/PyCMD
 """
 
 import argparse
