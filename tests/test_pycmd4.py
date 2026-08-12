@@ -1002,6 +1002,242 @@ class VariableTests(EmulatorTestCase):
         self.assertIn("session", output)
 
 
+class ControlFlowTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+        self.saved_environment = dict(os.environ)
+        (self.root / "notes.txt").write_text("alpha TODO\nbeta\ngamma TODO\n", encoding="utf-8")
+        (self.root / "src").mkdir()
+        (self.root / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+        (self.root / "src" / "b.py").write_text("y = 2\n", encoding="utf-8")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved_environment)
+        super().tearDown()
+
+    def test_if_runs_the_then_branch(self):
+        _, output, _ = self.run_command("IF EXISTS notes.txt THEN ECHO found ELSE ECHO missing")
+        self.assertIn("found", output)
+        self.assertNotIn("missing", output)
+
+    def test_if_runs_the_else_branch(self):
+        _, output, _ = self.run_command("IF EXISTS nope.txt THEN ECHO found ELSE ECHO missing")
+        self.assertIn("missing", output)
+        self.assertNotIn("found", output)
+
+    def test_if_without_else_succeeds_quietly(self):
+        result, output, _ = self.run_command("IF EXISTS nope.txt THEN ECHO found")
+        self.assertTrue(result)
+        self.assertEqual(output.strip(), "")
+
+    def test_if_condition_forms(self):
+        cases = [
+            ("ISFILE notes.txt", True),
+            ("ISDIR src", True),
+            ("ISDIR notes.txt", False),
+            ("NOT ISDIR notes.txt", True),
+            ("NOT NOT ISDIR src", True),
+            ("a == a", True),
+            ("a == b", False),
+            ("a != b", True),
+            ("2 > 1", True),
+            ("1 > 2", False),
+            ("EMPTY", True),
+        ]
+        for condition, expected in cases:
+            with self.subTest(condition=condition):
+                self.assertEqual(self.emulator.evaluate_condition(condition), expected)
+
+    def test_if_rejects_a_malformed_condition(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(self.emulator.evaluate_condition("wat is this"))
+        result, _, errors = self.run_command("IF wat is this THEN ECHO x")
+        self.assertFalse(result)
+        self.assertIn("Unrecognised condition", errors)
+
+    def test_if_requires_then(self):
+        result, _, errors = self.run_command("IF EXISTS notes.txt ECHO x")
+        self.assertFalse(result)
+        self.assertIn("Usage: IF", errors)
+
+    def test_if_keyword_inside_quotes_is_not_a_separator(self):
+        _, output, _ = self.run_command('IF a == a THEN ECHO "then and else"')
+        self.assertIn("then and else", output)
+
+    def test_for_iterates_over_a_glob(self):
+        _, output, _ = self.run_command("FOR f IN src/*.py DO ECHO processing $f")
+        self.assertIn("a.py", output)
+        self.assertIn("b.py", output)
+        self.assertEqual(output.count("processing"), 2)
+
+    def test_for_restores_the_loop_variable(self):
+        self.run_command("SET f=original")
+        self.run_command("FOR f IN one two DO ECHO $f")
+        self.assertEqual(self.emulator.variables.get("f"), "original")
+
+    def test_for_removes_a_variable_it_created(self):
+        self.run_command("FOR tmpvar IN one DO ECHO $tmpvar")
+        self.assertNotIn("tmpvar", self.emulator.variables)
+        self.assertNotIn("tmpvar", os.environ)
+
+    def test_for_and_if_compose(self):
+        _, output, _ = self.run_command("FOR f IN src/*.py notes.txt DO IF ISFILE $f THEN ECHO ok $f")
+        self.assertEqual(output.count("ok"), 3)
+
+    def test_for_rejects_a_bad_name_or_missing_body(self):
+        self.assertFalse(self.run_command("FOR bad-name IN a DO ECHO $x")[0])
+        self.assertFalse(self.run_command("FOR f IN a b c")[0])
+
+    def test_for_over_nothing_is_not_a_failure(self):
+        result, _, errors = self.run_command("FOR f IN nosuch*.zzz DO ECHO $f")
+        self.assertTrue(result)
+        self.assertIn("nothing to iterate", errors)
+
+
+class SubstitutionTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+        self.saved_environment = dict(os.environ)
+        (self.root / "notes.txt").write_text("alpha TODO\nbeta\ngamma TODO\n", encoding="utf-8")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved_environment)
+        super().tearDown()
+
+    def test_substitution_inserts_command_output(self):
+        _, output, _ = self.run_command("ECHO today is $(ECHO Monday)")
+        self.assertIn("today is Monday", output)
+
+    def test_substitution_may_contain_a_pipe(self):
+        """The operator scanner must treat $(...) as opaque."""
+        _, output, _ = self.run_command("ECHO count is $(TYPE notes.txt | COUNT --lines)")
+        self.assertIn("count is 3", output)
+
+    def test_substitution_may_contain_a_redirect_character(self):
+        _, output, _ = self.run_command("ECHO n=$(TYPE notes.txt | GREP --count TODO)")
+        self.assertIn("n=2", output)
+        self.assertFalse(list(self.root.glob("*count*")), "the > was treated as a redirect")
+
+    def test_substitution_result_can_be_stored(self):
+        self.run_command("SET N=$(TYPE notes.txt | GREP --count TODO)")
+        self.assertEqual(self.emulator.variables.get("N"), "2")
+
+    def test_substitution_output_cannot_inject_a_command(self):
+        victim = self.root / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        self.run_command('MACRO evil ECHO "; DEL --force victim.txt"')
+        _, output, _ = self.run_command("ECHO $(RUNMACRO evil)")
+        self.assertTrue(victim.exists(), "substituted output was executed")
+
+    def test_unbalanced_substitution_is_left_literal(self):
+        _, output, _ = self.run_command("ECHO $(ECHO unclosed")
+        self.assertIn("$(ECHO unclosed", output)
+
+    def test_nested_substitution(self):
+        _, output, _ = self.run_command("ECHO $(ECHO $(ECHO deep))")
+        self.assertIn("deep", output)
+
+    def test_substitution_honours_the_expansion_policy(self):
+        self.emulator.policy["expand_variables"] = False
+        _, output, _ = self.run_command("ECHO $(ECHO Monday)")
+        self.assertIn("$(ECHO Monday)", output)
+
+
+class SearchDiffReplaceTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "a.py").write_text("needle here\n", encoding="utf-8")
+        (self.root / "src" / "b.py").write_text("nothing\n", encoding="utf-8")
+        (self.root / "top.txt").write_text("plain\n", encoding="utf-8")
+
+    def test_search_finds_files_recursively(self):
+        _, output, _ = self.run_command("SEARCH *.py")
+        self.assertIn("a.py", output)
+        self.assertIn("b.py", output)
+        self.assertNotIn("top.txt", output)
+
+    def test_search_by_content(self):
+        _, output, _ = self.run_command("SEARCH *.py --containing needle")
+        self.assertIn("a.py", output)
+        self.assertNotIn("b.py", output)
+
+    def test_search_with_no_matches_is_a_failure(self):
+        result, output, errors = self.run_command("SEARCH *.nosuchext")
+        self.assertEqual(output.strip(), "", "a diagnostic on stdout corrupts pipes")
+        self.assertIn("No files match", errors)
+        self.assertFalse(result, "no matches must be non-zero so || works")
+
+    def test_search_limit_is_reported_not_silent(self):
+        _, _, errors = self.run_command("SEARCH * --limit 1")
+        self.assertIn("--limit", errors)
+
+    def test_diff_reports_differences_and_identity(self):
+        (self.root / "l.txt").write_text("a\nb\n", encoding="utf-8")
+        (self.root / "r.txt").write_text("a\nc\n", encoding="utf-8")
+        result, output, _ = self.run_command("DIFF l.txt r.txt")
+        self.assertFalse(result, "differences must be non-zero, like diff(1)")
+        self.assertIn("-b", output)
+        self.assertIn("+c", output)
+
+        result, output, _ = self.run_command("DIFF l.txt l.txt")
+        self.assertTrue(result)
+        self.assertIn("identical", output)
+
+    def test_replace_streams_by_default(self):
+        _, output, _ = self.run_command("REPLACE needle pin src/a.py")
+        self.assertIn("pin here", output)
+        self.assertIn("needle", (self.root / "src" / "a.py").read_text(encoding="utf-8"))
+
+    def test_replace_in_place_rewrites_the_file(self):
+        result, _, _ = self.run_command("REPLACE --in-place needle pin src/a.py")
+        self.assertTrue(result)
+        self.assertIn("pin here", (self.root / "src" / "a.py").read_text(encoding="utf-8"))
+
+    def test_replace_in_place_needs_a_file(self):
+        self.assertFalse(self.run_command("REPLACE --in-place a b")[0])
+
+    def test_replace_treats_the_search_as_literal_unless_regex(self):
+        (self.root / "dots.txt").write_text("a.c\nabc\n", encoding="utf-8")
+        _, output, _ = self.run_command("REPLACE a.c X dots.txt")
+        self.assertIn("X", output)
+        self.assertIn("abc", output, "the dot must not act as a wildcard")
+
+
+class DirectoryStackTests(EmulatorTestCase):
+    def test_pushd_popd_round_trip(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        os.chdir(self.root)
+        start = os.getcwd()
+
+        result, _, _ = self.run_command("PUSHD nested")
+        self.assertTrue(result)
+        self.assertEqual(os.getcwd(), str(nested))
+
+        result, _, _ = self.run_command("POPD")
+        self.assertTrue(result)
+        self.assertEqual(os.getcwd(), start)
+
+    def test_popd_on_an_empty_stack_fails(self):
+        result, _, errors = self.run_command("POPD")
+        self.assertFalse(result)
+        self.assertIn("empty", errors)
+
+    def test_dirs_lists_the_stack(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        os.chdir(self.root)
+        self.run_command("PUSHD nested")
+        _, output, _ = self.run_command("DIRS")
+        self.assertIn(str(self.root), output)
+
+
 class CommandLineTests(unittest.TestCase):
     """End-to-end coverage of main(), which nothing exercised before 4.0."""
 

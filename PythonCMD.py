@@ -20,6 +20,7 @@ import atexit
 import collections
 import contextlib
 import difflib
+import fnmatch
 import getpass
 import glob
 import io
@@ -80,6 +81,14 @@ class CMDEmulator:
         "CWD": ("Navigation", "CWD <directory>", "Change working directory."),
         "CD": ("Navigation", "CD <directory>", "Alias for CWD."),
         "PWD": ("Navigation", "PWD", "Display the current working directory."),
+        "PUSHD": ("Navigation", "PUSHD [directory]", "Remember this directory, then change to another."),
+        "POPD": ("Navigation", "POPD", "Return to the directory PUSHD remembered."),
+        "DIRS": ("Navigation", "DIRS", "Show the directory stack."),
+        "IF": ("Control", "IF <condition> THEN <command> [ELSE <command>]", "Run a command conditionally."),
+        "FOR": ("Control", "FOR <name> IN <item> [more...] DO <command>", "Run a command once per item."),
+        "SEARCH": ("Files", "SEARCH [pattern] [--in root] [--containing text] [--limit n]", "Find files recursively."),
+        "DIFF": ("Text", "DIFF <left> <right>", "Show differences between two files."),
+        "REPLACE": ("Text", "REPLACE [--regex] [--case] [--in-place] <search> <new> [file...]", "Substitute text."),
         "DIR": ("Files", "DIR [path] [--details]", "List directory contents."),
         "MKDIR": ("Files", "MKDIR <directory> [more...]", "Create one or more directories."),
         "DEL": ("Files", "DEL [--dry-run] [--force] <file> [more...]", "Delete files; wildcards are expanded."),
@@ -95,7 +104,7 @@ class CMDEmulator:
         "SORT": ("Text", "SORT [--reverse] [--unique] [--numeric] [file...]", "Sort lines."),
         "HEAD": ("Text", "HEAD [-n count] [file...]", "Show the first lines."),
         "TAIL": ("Text", "TAIL [-n count] [file...]", "Show the last lines."),
-        "COUNT": ("Text", "COUNT [file...]", "Count lines, words and characters."),
+        "COUNT": ("Text", "COUNT [--lines|--words|--chars] [file...]", "Count lines, words and characters."),
         "SET": ("Environment", "SET [name=value]", "Show or set a session variable."),
         "UNSET": ("Environment", "UNSET <name>", "Remove a session variable."),
         "ENV": ("Environment", "ENV [filter]", "Show environment and session variables."),
@@ -157,7 +166,7 @@ class CMDEmulator:
 
     # Commands whose tail is data, not a command line: either the OS shell owns
     # it verbatim, or it is a definition body that must keep its own operators.
-    RAW_TAIL_COMMANDS = ("!", "LEGACY", "RUN", "ALIAS", "MACRO", "EXPLAIN")
+    RAW_TAIL_COMMANDS = ("!", "LEGACY", "RUN", "ALIAS", "MACRO", "EXPLAIN", "IF", "FOR")
     OPERATORS = ("&&", "||", "|", ";")
     NAME_FORBIDDEN = set(" \t\"'`;|&<>()")
     MAX_EXPANSION_DEPTH = 10
@@ -208,6 +217,9 @@ class CMDEmulator:
         # cannot receive a depth argument, so the guard has to live on self or a
         # macro that invokes itself by name recurses until Python's stack gives.
         self._macro_depth = 0
+        self._substitution_depth = 0
+        self._loop_depth = 0
+        self.directory_stack = []
         self._executing_line = None
         self._completion_cache = (None, [])
 
@@ -251,6 +263,14 @@ class CMDEmulator:
             "UNSET": self.cmd_unset,
             "ENV": self.cmd_env,
             "PWD": self.cmd_pwd,
+            "PUSHD": self.cmd_pushd,
+            "POPD": self.cmd_popd,
+            "DIRS": self.cmd_dirs,
+            "IF": self.cmd_if,
+            "FOR": self.cmd_for,
+            "SEARCH": self.cmd_search,
+            "DIFF": self.cmd_diff,
+            "REPLACE": self.cmd_replace,
             "ECHO": self.cmd_echo,
             "RUN": self.cmd_run,
             "TIME": self.cmd_time,
@@ -807,6 +827,24 @@ class CMDEmulator:
         return value
 
     @staticmethod
+    def skip_substitution(text, index):
+        """Index just past the ')' closing a '$(' at index, or -1 if unbalanced.
+
+        The operator and redirection scanners use this to step over a whole
+        $(...) region, so a '|' or '>' inside a substitution belongs to the
+        inner command rather than splitting the outer line.
+        """
+        level = 1
+        cursor = index + 2
+        while cursor < len(text) and level:
+            if text[cursor] == "(":
+                level += 1
+            elif text[cursor] == ")":
+                level -= 1
+            cursor += 1
+        return -1 if level else cursor
+
+    @staticmethod
     def read_token(text, index):
         """Read one quote-aware token starting at index. Returns (token, index)."""
         length = len(text)
@@ -866,6 +904,12 @@ class CMDEmulator:
                 pending.append(char)
                 index += 1
                 continue
+            if line.startswith("$(", index):
+                end = self.skip_substitution(line, index)
+                if end > 0:
+                    pending.append(line[index:end])
+                    index = end
+                    continue
             matched = None
             for candidate in operators:
                 if line.startswith(candidate, index):
@@ -914,6 +958,12 @@ class CMDEmulator:
                 clean.append(char)
                 index += 1
                 continue
+            if text.startswith("$(", index):
+                end = self.skip_substitution(text, index)
+                if end > 0:
+                    clean.append(text[index:end])
+                    index = end
+                    continue
             if char in (">", "<"):
                 descriptor = 1 if char == ">" else 0
                 if char == ">" and clean and clean[-1] in ("1", "2"):
@@ -981,6 +1031,57 @@ class CMDEmulator:
                     handle.close()
                 except OSError:
                     pass
+
+    def expand_substitutions(self, text):
+        """Replace $(command) with that command's output.
+
+        Like variable expansion this runs after the line has been parsed, so
+        output containing ';' or '|' is inserted as text and can never become a
+        command of its own. Newlines collapse to spaces, as in other shells.
+        """
+        if "$(" not in text or not self.policy.get("expand_variables", True):
+            return text
+        if self._substitution_depth >= self.MAX_EXPANSION_DEPTH:
+            self.emit_error("Command substitution stopped: nested too deeply.")
+            return text
+
+        pieces = []
+        index = 0
+        while index < len(text):
+            start = text.find("$(", index)
+            if start < 0:
+                pieces.append(text[index:])
+                break
+            pieces.append(text[index:start])
+            level = 1
+            cursor = start + 2
+            while cursor < len(text) and level:
+                if text[cursor] == "(":
+                    level += 1
+                elif text[cursor] == ")":
+                    level -= 1
+                cursor += 1
+            if level:
+                # Unbalanced: leave it exactly as typed rather than guessing.
+                pieces.append(text[start:])
+                break
+            pieces.append(self.capture_output(text[start + 2:cursor - 1]))
+            index = cursor
+        return "".join(pieces)
+
+    def capture_output(self, command_line):
+        buffer = io.StringIO()
+        saved_out = self._stdout
+        self._stdout = buffer
+        self._capture_depth += 1
+        self._substitution_depth += 1
+        try:
+            self.run_line(command_line)
+        finally:
+            self._substitution_depth -= 1
+            self._capture_depth -= 1
+            self._stdout = saved_out
+        return " ".join(buffer.getvalue().split())
 
     VARIABLE_PATTERN = re.compile(r"\$(\?|\{\w+\}|\w+)")
 
@@ -1369,7 +1470,7 @@ class CMDEmulator:
             return 1
 
     def dispatch(self, command_line, alias_depth=0, macro_depth=0):
-        command_line = self.expand_variables(command_line)
+        command_line = self.expand_variables(self.expand_substitutions(command_line))
         command, arg_string = self.split_input(command_line)
         args = self.tokenise_args(arg_string)
         kind, name, payload = self.classify_command(command)
@@ -1409,13 +1510,21 @@ class CMDEmulator:
             return joined
         return None
 
-    def expand_globs(self, operands):
+    def expand_globs(self, operands, keep_unmatched=True):
+        """Expand wildcards.
+
+        keep_unmatched follows cmd.exe: a pattern that matches nothing is passed
+        through so the command can report it. FOR passes False instead, because
+        looping once over the literal text '*.py' is never what anyone means.
+        """
         expanded = []
         for operand in operands:
             if any(char in operand for char in "*?["):
                 matches = sorted(glob.glob(os.path.expanduser(operand)), key=str.lower)
                 if matches:
                     expanded.extend(matches)
+                    continue
+                if not keep_unmatched:
                     continue
             expanded.append(operand)
         return expanded
@@ -1713,6 +1822,209 @@ class CMDEmulator:
         return succeeded
 
     # ------------------------------------------------------------------
+    # Commands: directory stack
+    # ------------------------------------------------------------------
+
+    def cmd_pushd(self, args, arg_string=""):
+        target = self.path_operand(args) if args else None
+        if args and target is None:
+            self.emit_error("PUSHD accepts a single directory; quote paths containing spaces.")
+            return False
+
+        origin = os.getcwd()
+        if target:
+            try:
+                os.chdir(os.path.expanduser(target))
+            except OSError as err:
+                self.emit_error("Error changing directory:", err)
+                return False
+        self.directory_stack.append(origin)
+        self.update_prompt()
+        self.emit("Current Directory:", os.getcwd())
+        return True
+
+    def cmd_popd(self, args, arg_string=""):
+        if not self.directory_stack:
+            self.emit_error("The directory stack is empty.")
+            return False
+        target = self.directory_stack.pop()
+        try:
+            os.chdir(target)
+        except OSError as err:
+            self.emit_error("Error changing directory:", err)
+            return False
+        self.update_prompt()
+        self.emit("Current Directory:", os.getcwd())
+        return True
+
+    def cmd_dirs(self, args, arg_string=""):
+        if not self.directory_stack:
+            self.emit("The directory stack is empty.")
+            return True
+        rows = [(index, path) for index, path in enumerate(reversed(self.directory_stack), start=1)]
+        self.print_table(rows, headers=("Depth", "Directory"))
+        return True
+
+    # ------------------------------------------------------------------
+    # Commands: control flow
+    # ------------------------------------------------------------------
+
+    def find_keyword(self, text, keyword):
+        """Index of a bare, unquoted keyword, or -1."""
+        upper = text.upper()
+        length = len(keyword)
+        quote = None
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if quote:
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+                index += 1
+                continue
+            if upper.startswith(keyword, index):
+                before = text[index - 1] if index else " "
+                after = text[index + length] if index + length < len(text) else " "
+                if before.isspace() and after.isspace():
+                    return index
+            index += 1
+        return -1
+
+    def evaluate_condition(self, condition):
+        """Return True/False, or None when the condition itself is malformed."""
+        tokens = self.tokenise_args(condition)
+        if not tokens:
+            self.emit_error("IF needs a condition.")
+            return None
+
+        negate = False
+        while tokens and tokens[0].upper() == "NOT":
+            negate = not negate
+            tokens = tokens[1:]
+        if not tokens:
+            self.emit_error("IF needs a condition after NOT.")
+            return None
+
+        verb = tokens[0].upper()
+        rest = tokens[1:]
+        result = None
+
+        if verb in ("EXISTS", "ISFILE", "ISDIR") and len(rest) == 1:
+            path = os.path.expanduser(rest[0])
+            if verb == "EXISTS":
+                result = os.path.exists(path)
+            elif verb == "ISFILE":
+                result = os.path.isfile(path)
+            else:
+                result = os.path.isdir(path)
+        elif verb == "EMPTY":
+            result = not " ".join(rest).strip()
+        elif len(tokens) == 3 and tokens[1] in ("==", "!=", "<", ">"):
+            left, operator, right = tokens
+            if operator in ("<", ">"):
+                try:
+                    left_value, right_value = float(left), float(right)
+                except ValueError:
+                    self.emit_error("%s and %s are not both numbers." % (left, right))
+                    return None
+                result = left_value < right_value if operator == "<" else left_value > right_value
+            else:
+                result = (left == right) if operator == "==" else (left != right)
+        else:
+            self.emit_error("Unrecognised condition: %s" % condition.strip())
+            self.emit_error("Try: EXISTS <path>, ISFILE, ISDIR, EMPTY <text>, or <a> == <b>.")
+            return None
+
+        return (not result) if negate else result
+
+    def cmd_if(self, args, arg_string=""):
+        then_at = self.find_keyword(arg_string, "THEN")
+        if then_at < 0:
+            self.emit_error("Usage: %s" % self.COMMAND_INFO["IF"][1])
+            return False
+
+        condition = arg_string[:then_at]
+        remainder = arg_string[then_at + 4:]
+        else_at = self.find_keyword(remainder, "ELSE")
+        if else_at < 0:
+            consequent, alternative = remainder.strip(), ""
+        else:
+            consequent = remainder[:else_at].strip()
+            alternative = remainder[else_at + 4:].strip()
+
+        if not consequent:
+            self.emit_error("IF needs a command after THEN.")
+            return False
+
+        outcome = self.evaluate_condition(condition)
+        if outcome is None:
+            return False
+
+        branch = consequent if outcome else alternative
+        if not branch:
+            # The condition was false and there is no ELSE: nothing to do, and
+            # doing nothing successfully is the point of an IF without an ELSE.
+            return True
+        return self.execute_line(branch, record_history=False)
+
+    def cmd_for(self, args, arg_string=""):
+        in_at = self.find_keyword(arg_string, "IN")
+        do_at = self.find_keyword(arg_string, "DO")
+        if in_at < 0 or do_at < 0 or do_at < in_at:
+            self.emit_error("Usage: %s" % self.COMMAND_INFO["FOR"][1])
+            return False
+
+        name = arg_string[:in_at].strip()
+        items_text = arg_string[in_at + 2:do_at]
+        body = arg_string[do_at + 2:].strip()
+
+        if not re.fullmatch(r"\w+", name or ""):
+            self.emit_error("FOR needs a variable name made of letters, digits or underscores.")
+            return False
+        if not body:
+            self.emit_error("FOR needs a command after DO.")
+            return False
+        if self._loop_depth >= self.MAX_EXPANSION_DEPTH:
+            self.emit_error("FOR stopped: loops nested too deeply.")
+            return False
+
+        items = self.expand_globs(self.tokenise_args(items_text), keep_unmatched=False)
+        if not items:
+            self.emit_error("FOR: nothing to iterate over.")
+            return True
+
+        had_value = name in self.variables
+        previous = self.variables.get(name)
+        stop_on_error = bool(self.policy.get("stop_on_error", False))
+        success = True
+
+        self._loop_depth += 1
+        try:
+            for item in items:
+                self.variables[name] = item
+                os.environ[name] = item
+                step_ok = self.execute_line(body, record_history=False)
+                success = step_ok and success
+                if not self.running:
+                    break
+                if stop_on_error and not step_ok:
+                    self.emit_error("FOR stopped after a failing command.")
+                    break
+        finally:
+            self._loop_depth -= 1
+            if had_value:
+                self.variables[name] = previous
+                os.environ[name] = previous
+            else:
+                self.variables.pop(name, None)
+                os.environ.pop(name, None)
+        return success
+
+    # ------------------------------------------------------------------
     # Commands: text (these read piped input as well as files)
     # ------------------------------------------------------------------
 
@@ -1871,14 +2183,184 @@ class CMDEmulator:
         return self.head_or_tail(args, "TAIL", take_last=True)
 
     def cmd_count(self, args, arg_string=""):
-        text = self.gather_input(args, self.COMMAND_INFO["COUNT"][1])
+        wanted = None
+        operands = []
+        for arg in args:
+            lowered = arg.lower()
+            if lowered in ("--lines", "-l"):
+                wanted = "lines"
+            elif lowered in ("--words", "-w"):
+                wanted = "words"
+            elif lowered in ("--chars", "--characters", "-c"):
+                wanted = "chars"
+            else:
+                operands.append(arg)
+
+        text = self.gather_input(operands, self.COMMAND_INFO["COUNT"][1])
         if text is None:
             return False
-        self.print_table(
-            [(len(text.splitlines()), len(text.split()), len(text))],
-            headers=("Lines", "Words", "Characters"),
-        )
+
+        totals = {"lines": len(text.splitlines()), "words": len(text.split()), "chars": len(text)}
+        if wanted:
+            # A bare number so COUNT composes: SET N=$(... | COUNT --lines)
+            self.emit(totals[wanted])
+        else:
+            self.print_table(
+                [(totals["lines"], totals["words"], totals["chars"])],
+                headers=("Lines", "Words", "Characters"),
+            )
         return True
+
+    def cmd_search(self, args, arg_string=""):
+        root = os.getcwd()
+        containing = None
+        limit = 200
+        patterns = []
+
+        index = 0
+        while index < len(args):
+            token = args[index].lower()
+            if token in ("--in", "--root"):
+                index += 1
+                if index >= len(args):
+                    self.emit_error("Usage: %s" % self.COMMAND_INFO["SEARCH"][1])
+                    return False
+                root = os.path.expanduser(args[index])
+            elif token in ("--containing", "-c"):
+                index += 1
+                if index >= len(args):
+                    self.emit_error("Usage: %s" % self.COMMAND_INFO["SEARCH"][1])
+                    return False
+                containing = args[index].lower()
+            elif token == "--limit":
+                index += 1
+                try:
+                    limit = int(args[index])
+                except (IndexError, ValueError):
+                    self.emit_error("SEARCH --limit needs a whole number.")
+                    return False
+            else:
+                patterns.append(args[index])
+            index += 1
+
+        if not os.path.isdir(root):
+            self.emit_error("SEARCH root is not a directory: %s" % root)
+            return False
+        pattern = patterns[0] if patterns else "*"
+
+        found = 0
+        truncated = False
+        for directory, subdirectories, names in os.walk(root):
+            subdirectories[:] = [name for name in subdirectories if name not in (".git", "__pycache__")]
+            for name in sorted(names, key=str.lower):
+                if not fnmatch.fnmatch(name, pattern):
+                    continue
+                path = os.path.join(directory, name)
+                if containing is not None:
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                            if containing not in stream.read().lower():
+                                continue
+                    except OSError:
+                        continue
+                self.emit(path)
+                found += 1
+                if found >= limit:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+        if truncated:
+            self.emit_error("Stopped at %d results; raise it with --limit." % limit)
+        elif not found:
+            # A diagnostic, not data: on stdout it would be counted as a result
+            # by anything downstream in a pipe or a $(...) substitution.
+            self.emit_error("No files match: %s" % pattern)
+        # No matches is a non-zero status, so SEARCH composes with || .
+        return bool(found)
+
+    def cmd_diff(self, args, arg_string=""):
+        if len(args) != 2:
+            self.emit_error("Usage: DIFF <left> <right>")
+            return False
+        sides = []
+        for operand in args:
+            path = os.path.expanduser(operand)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                    sides.append(stream.read().splitlines(keepends=True))
+            except OSError as err:
+                self.emit_error("Error reading file:", err)
+                return False
+
+        lines = list(
+            difflib.unified_diff(sides[0], sides[1], fromfile=args[0], tofile=args[1], lineterm="")
+        )
+        if not lines:
+            self.emit("Files are identical.")
+            return True
+        for line in lines:
+            self.emit(line.rstrip("\n"))
+        # Differences found is a non-zero status, matching diff(1).
+        return False
+
+    def cmd_replace(self, args, arg_string=""):
+        use_regex = False
+        case_sensitive = False
+        in_place = False
+        operands = []
+        for arg in args:
+            lowered = arg.lower()
+            if lowered in ("--regex", "-e"):
+                use_regex = True
+            elif lowered in ("--case", "-s"):
+                case_sensitive = True
+            elif lowered in ("--in-place", "-i"):
+                in_place = True
+            else:
+                operands.append(arg)
+
+        if len(operands) < 2:
+            self.emit_error("Usage: %s" % self.COMMAND_INFO["REPLACE"][1])
+            return False
+
+        search, replacement = operands[0], operands[1]
+        files = operands[2:]
+        if in_place and not files:
+            self.emit_error("REPLACE --in-place needs at least one file.")
+            return False
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = search if use_regex else re.escape(search)
+        try:
+            matcher = re.compile(pattern, flags)
+        except re.error as err:
+            self.emit_error("Invalid pattern:", err)
+            return False
+
+        if not in_place:
+            text = self.gather_input(files, self.COMMAND_INFO["REPLACE"][1])
+            if text is None:
+                return False
+            self.emit(matcher.sub(replacement, text), end="")
+            return True
+
+        succeeded = True
+        for operand in self.expand_globs(files):
+            path = os.path.expanduser(operand)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as stream:
+                    original = stream.read()
+                updated, count = matcher.subn(replacement, original)
+                if count:
+                    with open(path, "w", encoding="utf-8") as stream:
+                        stream.write(updated)
+                self.emit("%s: %d replacement(s)" % (path, count))
+            except OSError as err:
+                self.emit_error("Error rewriting file:", err)
+                succeeded = False
+        return succeeded
 
     # ------------------------------------------------------------------
     # Commands: environment

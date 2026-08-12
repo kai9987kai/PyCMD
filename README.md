@@ -29,8 +29,14 @@ EXPLAIN <line>            show exactly how PyCMD will interpret a line
 - **Text tools**: `TYPE`, `GREP`, `SORT`, `HEAD`, `TAIL`, `COUNT`. They read a
   file *or* piped input, so a whole pipeline can run without a single external
   program: `TYPE notes.txt | SORT --unique | GREP todo`.
-- **Variables**: `SET`, `UNSET`, `ENV`, with `$NAME`, `${NAME}` and `$?`
-  (the last exit status). Variables are exported, so child processes see them.
+- **Variables and substitution**: `SET`, `UNSET`, `ENV`, with `$NAME`,
+  `${NAME}`, `$?` (the last exit status) and `$(command)` substitution.
+  Variables are exported, so child processes see them.
+- **Control flow**: `IF <condition> THEN <cmd> [ELSE <cmd>]` and
+  `FOR <name> IN <items> DO <cmd>` — enough to write real scripts.
+- **Navigation**: `PUSHD`, `POPD`, `DIRS` alongside bookmarks.
+- **Searching**: `SEARCH` finds files recursively by name or content;
+  `DIFF` compares two files; `REPLACE` substitutes text in a stream or in place.
 - **Operators**: chain commands with `&&` (on success), `||` (on failure) and
   `;` (always). A single `&` stays literal, so `DEL A&B.txt` still works.
 - **Redirection**: `>`, `>>`, `2>`, `2>&1` and `<` work on PyCMD's own commands
@@ -117,9 +123,30 @@ DIR | COUNT
 SET EDITOR=code
 ECHO using $EDITOR
 GREP -n TODO *.py || ECHO nothing left to do
+SET N=$(TYPE notes.txt | GREP --count TODO)
+IF $N > 0 THEN ECHO $N todos left ELSE ECHO all clear
+FOR f IN src/*.py DO IF ISFILE $f THEN ECHO checking $f
+SEARCH *.py --containing "import os"
+REPLACE --in-place oldname newname src/*.py
+PUSHD build && DIR && POPD
 RUN --safe python --version
 !echo shell shortcut
 EXPLAIN ll | findstr py
+```
+
+### Conditions for `IF`
+
+`EXISTS <path>`, `ISFILE <path>`, `ISDIR <path>`, `EMPTY <text>`, `<a> == <b>`,
+`<a> != <b>`, and numeric `<a> < <b>` / `<a> > <b>` — any of them may be
+preceded by `NOT`.
+
+A script can now do real work:
+
+```text
+REM tidy up, then report what is left
+FOR f IN *.tmp DO DEL --force $f
+SET LEFT=$(SEARCH *.tmp | COUNT --lines)
+IF $LEFT == 0 THEN ECHO clean ELSE ECHO $LEFT left over
 ```
 
 ## Command line
@@ -174,9 +201,16 @@ Besides the execution policy above:
 - `SORT`, `TYPE`, `COPY`, `MOVE` and friends are PyCMD builtins, so they take
   precedence over the Windows programs of the same name. Use `!sort` or
   `RUN sort` when you specifically want the system one.
-- Variables expand as `$NAME`, not `%NAME%`, and expansion happens *after* the
-  line is parsed — so a variable holding `; DEL x` is text, never a command.
-  An unknown name is left as typed rather than blanked.
+- Variables expand as `$NAME`, not `%NAME%`. Expansion and `$(...)` both happen
+  *after* the line is parsed, so a variable or a command's output holding
+  `; DEL x` is text, never a command. An unknown name is left as typed rather
+  than blanked, and an unbalanced `$(` is left literal.
+- `$(...)` collapses newlines to spaces. Use `COUNT --lines` and friends when
+  you want a single value to store in a variable.
+- `IF` and `FOR` take the rest of the line as their body, so `&&`, `|` and `>`
+  inside them belong to the branch or loop body, not to the `IF`/`FOR` itself.
+- `FOR` skips wildcards that match nothing, rather than looping once over the
+  literal pattern.
 - `!`, `LEGACY` and `RUN` pass their tail to the OS shell verbatim, so
   operators and redirection in those lines are the shell's to interpret, not
   PyCMD's. `ALIAS`, `MACRO` and `EXPLAIN` likewise keep their tail intact.
