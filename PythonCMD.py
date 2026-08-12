@@ -60,6 +60,7 @@ LAUNCH_ARGV = [
 
 DEFAULT_POLICY = {
     "shell_fallback": "confirm",
+    "expand_variables": True,
     "path_programs": True,
     "legacy": True,
     "run_shell": True,
@@ -84,6 +85,20 @@ class CMDEmulator:
         "DEL": ("Files", "DEL [--dry-run] [--force] <file> [more...]", "Delete files; wildcards are expanded."),
         "ERASE": ("Files", "ERASE [--dry-run] [--force] <file> [more...]", "Alias for DEL."),
         "TREE": ("Files", "TREE [path] [depth]", "Show a compact directory tree."),
+        "COPY": ("Files", "COPY <source> [more...] <destination>", "Copy files; wildcards are expanded."),
+        "MOVE": ("Files", "MOVE <source> [more...] <destination>", "Move files; wildcards are expanded."),
+        "RENAME": ("Files", "RENAME <old> <new>", "Rename a single file or directory."),
+        "RMDIR": ("Files", "RMDIR [--recurse] [--force] <directory> [more...]", "Remove directories."),
+        "TOUCH": ("Files", "TOUCH <file> [more...]", "Create a file, or update its timestamp."),
+        "TYPE": ("Text", "TYPE <file> [more...]", "Print file contents; reads piped input too."),
+        "GREP": ("Text", "GREP [--regex] [--case] [--invert] [--count] [-n] <pattern> [file...]", "Show matching lines."),
+        "SORT": ("Text", "SORT [--reverse] [--unique] [--numeric] [file...]", "Sort lines."),
+        "HEAD": ("Text", "HEAD [-n count] [file...]", "Show the first lines."),
+        "TAIL": ("Text", "TAIL [-n count] [file...]", "Show the last lines."),
+        "COUNT": ("Text", "COUNT [file...]", "Count lines, words and characters."),
+        "SET": ("Environment", "SET [name=value]", "Show or set a session variable."),
+        "UNSET": ("Environment", "UNSET <name>", "Remove a session variable."),
+        "ENV": ("Environment", "ENV [filter]", "Show environment and session variables."),
         "ECHO": ("Basic", "ECHO <text>", "Display the given text."),
         "CLS": ("Basic", "CLS", "Clear the screen."),
         "COLOR": ("Basic", "COLOR <code>", "Change Windows console color."),
@@ -124,7 +139,10 @@ class CMDEmulator:
     FEATURED = (
         "CWD",
         "DIR",
-        "TREE",
+        "COPY",
+        "TYPE",
+        "GREP",
+        "SET",
         "RUN",
         "!",
         "ALIAS",
@@ -167,6 +185,7 @@ class CMDEmulator:
         self.policy = dict(DEFAULT_POLICY)
         self.stored_policy = dict(DEFAULT_POLICY)
         self.quarantined = {}
+        self.variables = {}
         self.command_stats = collections.deque(maxlen=200)
         self.history_file = history_file
         self.config_file = config_file
@@ -217,6 +236,20 @@ class CMDEmulator:
             "MKDIR": self.cmd_mkdir,
             "DEL": self.cmd_del,
             "ERASE": self.cmd_del,
+            "COPY": self.cmd_copy,
+            "MOVE": self.cmd_move,
+            "RENAME": self.cmd_rename,
+            "RMDIR": self.cmd_rmdir,
+            "TOUCH": self.cmd_touch,
+            "TYPE": self.cmd_type,
+            "GREP": self.cmd_grep,
+            "SORT": self.cmd_sort,
+            "HEAD": self.cmd_head,
+            "TAIL": self.cmd_tail,
+            "COUNT": self.cmd_count,
+            "SET": self.cmd_set,
+            "UNSET": self.cmd_unset,
+            "ENV": self.cmd_env,
             "PWD": self.cmd_pwd,
             "ECHO": self.cmd_echo,
             "RUN": self.cmd_run,
@@ -949,6 +982,31 @@ class CMDEmulator:
                 except OSError:
                     pass
 
+    VARIABLE_PATTERN = re.compile(r"\$(\?|\{\w+\}|\w+)")
+
+    def expand_variables(self, text):
+        """Substitute $NAME, ${NAME} and $? .
+
+        Deliberately applied *after* operators and redirection have been parsed,
+        so a variable holding '; DEL x' can never become a second command. An
+        unknown name is left alone rather than blanked, so a literal $ survives.
+        """
+        if not text or "$" not in text or not self.policy.get("expand_variables", True):
+            return text
+
+        def replace(match):
+            name = match.group(1)
+            if name == "?":
+                return str(self.last_status)
+            if name.startswith("{"):
+                name = name[1:-1]
+            if name in self.variables:
+                return self.variables[name]
+            value = os.environ.get(name)
+            return value if value is not None else match.group(0)
+
+        return self.VARIABLE_PATTERN.sub(replace, text)
+
     def is_raw_tail(self, command_line):
         """True for commands whose tail belongs to the OS shell verbatim."""
         command, _ = self.split_input(command_line)
@@ -1289,6 +1347,10 @@ class CMDEmulator:
             if not stage_text:
                 self.emit_error("Syntax error: redirection without a command.")
                 return 1
+            redirections = [
+                (descriptor, mode, target if mode == "dup" else self.expand_variables(target))
+                for descriptor, mode, target in redirections
+            ]
 
         # Vet the command before opening any redirection target, so a refused
         # command never truncates a file on its way to being refused.
@@ -1307,6 +1369,7 @@ class CMDEmulator:
             return 1
 
     def dispatch(self, command_line, alias_depth=0, macro_depth=0):
+        command_line = self.expand_variables(command_line)
         command, arg_string = self.split_input(command_line)
         args = self.tokenise_args(arg_string)
         kind, name, payload = self.classify_command(command)
@@ -1542,6 +1605,340 @@ class CMDEmulator:
                 self.emit_error("Error deleting file:", err)
                 succeeded = False
         return succeeded
+
+    def transfer_files(self, args, verb, action):
+        """Shared COPY/MOVE body: <source...> <destination>."""
+        operands = [arg for arg in args if not arg.startswith("--")]
+        if len(operands) < 2:
+            self.emit_error("Usage: %s <source> [more...] <destination>" % verb)
+            return False
+
+        destination = os.path.expanduser(operands[-1])
+        sources = [os.path.expanduser(path) for path in self.expand_globs(operands[:-1])]
+        into_directory = os.path.isdir(destination)
+        if len(sources) > 1 and not into_directory:
+            self.emit_error("%s needs an existing directory as the destination for several files." % verb)
+            return False
+
+        succeeded = True
+        for source in sources:
+            target = os.path.join(destination, os.path.basename(source)) if into_directory else destination
+            if os.path.abspath(source) == os.path.abspath(target):
+                self.emit_error("Source and destination are the same file: %s" % source)
+                succeeded = False
+                continue
+            try:
+                action(source, target)
+                self.emit("%s -> %s" % (source, target))
+            except (OSError, shutil.Error) as err:
+                self.emit_error("Error during %s:" % verb.lower(), err)
+                succeeded = False
+        return succeeded
+
+    def cmd_copy(self, args, arg_string=""):
+        return self.transfer_files(args, "COPY", shutil.copy2)
+
+    def cmd_move(self, args, arg_string=""):
+        return self.transfer_files(args, "MOVE", shutil.move)
+
+    def cmd_rename(self, args, arg_string=""):
+        if len(args) != 2:
+            self.emit_error("Usage: RENAME <old> <new>")
+            return False
+        old, new = (os.path.expanduser(value) for value in args)
+        if os.path.exists(new):
+            self.emit_error("Refusing to overwrite an existing path: %s" % new)
+            return False
+        try:
+            os.rename(old, new)
+            self.emit("%s -> %s" % (old, new))
+            return True
+        except OSError as err:
+            self.emit_error("Error renaming:", err)
+            return False
+
+    def cmd_rmdir(self, args, arg_string=""):
+        recurse = False
+        force = False
+        operands = []
+        for arg in args:
+            lowered = arg.lower()
+            if lowered in ("--recurse", "/s", "-r"):
+                recurse = True
+            elif lowered in ("--force", "/force", "-f"):
+                force = True
+            else:
+                operands.append(arg)
+
+        if not operands:
+            self.emit_error("Usage: RMDIR [--recurse] [--force] <directory> [more...]")
+            return False
+
+        targets = [os.path.expanduser(path) for path in self.expand_globs(operands)]
+        if recurse and not force:
+            self.emit("About to delete these directories and everything in them:")
+            for path in targets:
+                self.emit(" ", path)
+            if not self.confirm("Delete recursively? [y/N] "):
+                self.emit_error("Cancelled. Use --force to skip this prompt.")
+                return False
+
+        succeeded = True
+        for path in targets:
+            try:
+                if recurse:
+                    shutil.rmtree(path)
+                else:
+                    os.rmdir(path)
+                self.emit("Directory '%s' removed." % path)
+            except OSError as err:
+                self.emit_error("Error removing directory:", err)
+                succeeded = False
+        return succeeded
+
+    def cmd_touch(self, args, arg_string=""):
+        if not args:
+            self.emit_error("Usage: TOUCH <file> [more...]")
+            return False
+        succeeded = True
+        for operand in args:
+            path = os.path.expanduser(operand)
+            try:
+                with open(path, "a", encoding="utf-8"):
+                    pass
+                os.utime(path, None)
+            except OSError as err:
+                self.emit_error("Error touching file:", err)
+                succeeded = False
+        return succeeded
+
+    # ------------------------------------------------------------------
+    # Commands: text (these read piped input as well as files)
+    # ------------------------------------------------------------------
+
+    def gather_input(self, operands, usage):
+        """Text from the pipe or from named files. None means 'already reported'."""
+        if self._pipe_input is not None:
+            return self._pipe_input
+        if not operands:
+            self.emit_error("Usage: %s" % usage)
+            self.emit_error("Give a filename, or pipe input in with |.")
+            return None
+        chunks = []
+        for operand in self.expand_globs(operands):
+            try:
+                with open(os.path.expanduser(operand), "r", encoding="utf-8", errors="replace") as stream:
+                    chunks.append(stream.read())
+            except OSError as err:
+                self.emit_error("Error reading file:", err)
+                return None
+        return "".join(chunks)
+
+    def cmd_type(self, args, arg_string=""):
+        text = self.gather_input(args, self.COMMAND_INFO["TYPE"][1])
+        if text is None:
+            return False
+        self.emit(text, end="" if text.endswith("\n") or not text else "\n")
+        return True
+
+    def cmd_grep(self, args, arg_string=""):
+        use_regex = False
+        case_sensitive = False
+        invert = False
+        only_count = False
+        numbered = False
+        operands = []
+        for arg in args:
+            lowered = arg.lower()
+            if lowered in ("--regex", "-e"):
+                use_regex = True
+            elif lowered in ("--case", "-s"):
+                case_sensitive = True
+            elif lowered in ("--invert", "-v"):
+                invert = True
+            elif lowered in ("--count", "-c"):
+                only_count = True
+            elif lowered in ("--line-numbers", "-n"):
+                numbered = True
+            else:
+                operands.append(arg)
+
+        if not operands:
+            self.emit_error("Usage: %s" % self.COMMAND_INFO["GREP"][1])
+            return False
+
+        pattern = operands[0]
+        text = self.gather_input(operands[1:], self.COMMAND_INFO["GREP"][1])
+        if text is None:
+            return False
+
+        if use_regex:
+            try:
+                matcher = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+            except re.error as err:
+                self.emit_error("Invalid pattern:", err)
+                return False
+            hit = lambda line: bool(matcher.search(line))
+        elif case_sensitive:
+            hit = lambda line: pattern in line
+        else:
+            needle = pattern.lower()
+            hit = lambda line: needle in line.lower()
+
+        matches = [
+            (number, line)
+            for number, line in enumerate(text.splitlines(), start=1)
+            if hit(line) != invert
+        ]
+        if only_count:
+            self.emit(len(matches))
+            return bool(matches)
+        for number, line in matches:
+            self.emit(("%d: %s" % (number, line)) if numbered else line)
+        # Like grep, "no matches" is a non-zero status so && and || work.
+        return bool(matches)
+
+    def cmd_sort(self, args, arg_string=""):
+        reverse = False
+        unique = False
+        numeric = False
+        operands = []
+        for arg in args:
+            lowered = arg.lower()
+            if lowered in ("--reverse", "-r"):
+                reverse = True
+            elif lowered in ("--unique", "-u"):
+                unique = True
+            elif lowered in ("--numeric", "-n"):
+                numeric = True
+            else:
+                operands.append(arg)
+
+        text = self.gather_input(operands, self.COMMAND_INFO["SORT"][1])
+        if text is None:
+            return False
+
+        lines = text.splitlines()
+        if unique:
+            seen = set()
+            lines = [line for line in lines if not (line in seen or seen.add(line))]
+
+        def numeric_key(line):
+            match = re.search(r"-?\d+(?:\.\d+)?", line)
+            return (0, float(match.group())) if match else (1, 0.0)
+
+        lines.sort(key=numeric_key if numeric else str.lower, reverse=reverse)
+        for line in lines:
+            self.emit(line)
+        return True
+
+    def head_or_tail(self, args, name, take_last):
+        count = 10
+        operands = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg.lower() in ("-n", "--lines"):
+                index += 1
+                if index >= len(args):
+                    self.emit_error("Usage: %s" % self.COMMAND_INFO[name][1])
+                    return False
+                try:
+                    count = int(args[index])
+                except ValueError:
+                    self.emit_error("%s needs a whole number of lines." % name)
+                    return False
+            else:
+                operands.append(arg)
+            index += 1
+
+        if count < 1:
+            self.emit_error("%s needs a count of 1 or more." % name)
+            return False
+
+        text = self.gather_input(operands, self.COMMAND_INFO[name][1])
+        if text is None:
+            return False
+        lines = text.splitlines()
+        for line in (lines[-count:] if take_last else lines[:count]):
+            self.emit(line)
+        return True
+
+    def cmd_head(self, args, arg_string=""):
+        return self.head_or_tail(args, "HEAD", take_last=False)
+
+    def cmd_tail(self, args, arg_string=""):
+        return self.head_or_tail(args, "TAIL", take_last=True)
+
+    def cmd_count(self, args, arg_string=""):
+        text = self.gather_input(args, self.COMMAND_INFO["COUNT"][1])
+        if text is None:
+            return False
+        self.print_table(
+            [(len(text.splitlines()), len(text.split()), len(text))],
+            headers=("Lines", "Words", "Characters"),
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Commands: environment
+    # ------------------------------------------------------------------
+
+    def cmd_set(self, args, arg_string=""):
+        if not args:
+            if not self.variables:
+                self.emit("No session variables set. Use SET name=value.")
+                return True
+            self.print_table(sorted(self.variables.items()), headers=("Name", "Value"))
+            return True
+
+        assignment = arg_string.strip()
+        if "=" in assignment:
+            name, value = assignment.split("=", 1)
+        elif len(args) >= 2:
+            name, value = args[0], arg_string.split(None, 1)[1]
+        else:
+            self.emit_error("Usage: SET name=value")
+            return False
+
+        name = name.strip()
+        value = self.strip_wrapping_quotes(value.strip())
+        if not name or not re.fullmatch(r"\w+", name):
+            self.emit_error("Variable names may contain only letters, digits and underscores.")
+            return False
+
+        self.variables[name] = value
+        # Write through to the real environment so every child process — argv
+        # programs, RUN, LEGACY — inherits it without any special plumbing.
+        os.environ[name] = value
+        self.emit("%s=%s" % (name, value))
+        return True
+
+    def cmd_unset(self, args, arg_string=""):
+        if len(args) != 1:
+            self.emit_error("Usage: UNSET <name>")
+            return False
+        name = args[0]
+        if name not in self.variables:
+            self.emit_error("No such session variable: %s" % name)
+            return False
+        del self.variables[name]
+        os.environ.pop(name, None)
+        self.emit("Variable '%s' removed." % name)
+        return True
+
+    def cmd_env(self, args, arg_string=""):
+        needle = args[0].lower() if args else ""
+        rows = []
+        for name, value in sorted(os.environ.items()):
+            if needle and needle not in name.lower():
+                continue
+            rows.append((name, value, "session" if name in self.variables else ""))
+        if not rows:
+            self.emit("No environment variables match: %s" % (args[0] if args else ""))
+            return True
+        self.print_table(rows, headers=("Name", "Value", "Source"))
+        return True
 
     # ------------------------------------------------------------------
     # Commands: basics

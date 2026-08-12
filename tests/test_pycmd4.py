@@ -764,6 +764,244 @@ class ReviewRegressionTests(EmulatorTestCase):
         self.assertTrue(stream.getvalue().strip(), "the line was silently dropped")
 
 
+class FileOperationTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+        (self.root / "a.txt").write_text("alpha", encoding="utf-8")
+
+    def test_copy_a_single_file(self):
+        result, _, _ = self.run_command("COPY a.txt b.txt")
+        self.assertTrue(result)
+        self.assertEqual((self.root / "b.txt").read_text(encoding="utf-8"), "alpha")
+        self.assertTrue((self.root / "a.txt").exists(), "COPY must not remove the source")
+
+    def test_copy_several_files_into_a_directory(self):
+        (self.root / "c.txt").write_text("gamma", encoding="utf-8")
+        (self.root / "dest").mkdir()
+        result, _, _ = self.run_command("COPY *.txt dest")
+        self.assertTrue(result)
+        self.assertTrue((self.root / "dest" / "a.txt").exists())
+        self.assertTrue((self.root / "dest" / "c.txt").exists())
+
+    def test_copy_several_files_needs_a_directory(self):
+        (self.root / "c.txt").write_text("gamma", encoding="utf-8")
+        result, _, errors = self.run_command("COPY a.txt c.txt not-a-dir")
+        self.assertFalse(result)
+        self.assertIn("existing directory", errors)
+
+    def test_copy_refuses_to_overwrite_itself(self):
+        result, _, errors = self.run_command("COPY a.txt a.txt")
+        self.assertFalse(result)
+        self.assertIn("same file", errors)
+        self.assertEqual((self.root / "a.txt").read_text(encoding="utf-8"), "alpha")
+
+    def test_move_removes_the_source(self):
+        result, _, _ = self.run_command("MOVE a.txt moved.txt")
+        self.assertTrue(result)
+        self.assertFalse((self.root / "a.txt").exists())
+        self.assertEqual((self.root / "moved.txt").read_text(encoding="utf-8"), "alpha")
+
+    def test_rename_refuses_to_clobber(self):
+        (self.root / "taken.txt").write_text("other", encoding="utf-8")
+        result, _, errors = self.run_command("RENAME a.txt taken.txt")
+        self.assertFalse(result)
+        self.assertIn("Refusing to overwrite", errors)
+        self.assertEqual((self.root / "taken.txt").read_text(encoding="utf-8"), "other")
+
+    def test_rmdir_removes_an_empty_directory(self):
+        (self.root / "empty").mkdir()
+        result, _, _ = self.run_command("RMDIR empty")
+        self.assertTrue(result)
+        self.assertFalse((self.root / "empty").exists())
+
+    def test_rmdir_refuses_a_full_directory_without_recurse(self):
+        full = self.root / "full"
+        full.mkdir()
+        (full / "inner.txt").write_text("x", encoding="utf-8")
+        result, _, _ = self.run_command("RMDIR full")
+        self.assertFalse(result)
+        self.assertTrue(full.exists())
+
+    def test_rmdir_recurse_asks_first(self):
+        full = self.root / "full"
+        full.mkdir()
+        (full / "inner.txt").write_text("x", encoding="utf-8")
+        self.emulator.interactive = True
+        with mock.patch("builtins.input", return_value="n"):
+            result, _, _ = self.run_command("RMDIR --recurse full")
+        self.assertFalse(result)
+        self.assertTrue(full.exists(), "a declined prompt must not delete anything")
+
+    def test_touch_creates_without_truncating(self):
+        self.run_command("TOUCH a.txt fresh.txt")
+        self.assertEqual((self.root / "a.txt").read_text(encoding="utf-8"), "alpha")
+        self.assertTrue((self.root / "fresh.txt").exists())
+
+
+class TextToolTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        os.chdir(self.root)
+        (self.root / "fruit.txt").write_text(
+            "banana\nApple\ncherry\napple\n", encoding="utf-8"
+        )
+
+    def test_type_prints_a_file(self):
+        _, output, _ = self.run_command("TYPE fruit.txt")
+        self.assertIn("banana", output)
+
+    def test_grep_is_case_insensitive_substring_by_default(self):
+        _, output, _ = self.run_command("GREP apple fruit.txt")
+        self.assertIn("Apple", output)
+        self.assertIn("apple", output)
+        self.assertNotIn("banana", output)
+
+    def test_grep_case_and_regex_and_invert(self):
+        _, output, _ = self.run_command("GREP --case apple fruit.txt")
+        self.assertNotIn("Apple", output)
+
+        _, output, _ = self.run_command("GREP --regex ^c.+y$ fruit.txt")
+        self.assertIn("cherry", output)
+        self.assertNotIn("banana", output)
+
+        _, output, _ = self.run_command("GREP --invert apple fruit.txt")
+        self.assertEqual(output.splitlines(), ["banana", "cherry"])
+
+    def test_grep_reports_no_matches_as_a_failure(self):
+        result, _, _ = self.run_command("GREP durian fruit.txt")
+        self.assertFalse(result, "no matches must be non-zero so || works")
+
+    def test_grep_rejects_an_invalid_regex(self):
+        result, _, errors = self.run_command("GREP --regex [unclosed fruit.txt")
+        self.assertFalse(result)
+        self.assertIn("Invalid pattern", errors)
+
+    def test_sort_unique_and_reverse_and_numeric(self):
+        # Stable sort: 'Apple' appeared first, so it stays ahead of 'apple'.
+        _, output, _ = self.run_command("SORT --unique fruit.txt")
+        self.assertEqual(output.splitlines(), ["Apple", "apple", "banana", "cherry"])
+
+        _, output, _ = self.run_command("SORT --unique --reverse fruit.txt")
+        self.assertEqual(output.splitlines()[0], "cherry")
+
+        (self.root / "n.txt").write_text("10\n9\n100\n", encoding="utf-8")
+        _, output, _ = self.run_command("SORT --numeric n.txt")
+        self.assertEqual(output.splitlines(), ["9", "10", "100"])
+
+    def test_head_and_tail(self):
+        _, output, _ = self.run_command("HEAD -n 2 fruit.txt")
+        self.assertEqual(output.splitlines(), ["banana", "Apple"])
+        _, output, _ = self.run_command("TAIL -n 1 fruit.txt")
+        self.assertEqual(output.splitlines(), ["apple"])
+
+    def test_head_rejects_a_useless_count(self):
+        self.assertFalse(self.run_command("HEAD -n 0 fruit.txt")[0])
+
+    def test_count_reports_totals(self):
+        _, output, _ = self.run_command("COUNT fruit.txt")
+        self.assertIn("4", output)
+
+    def test_text_tool_without_input_explains_itself(self):
+        result, _, errors = self.run_command("GREP")
+        self.assertFalse(result)
+        self.assertIn("Usage: GREP", errors)
+
+    def test_builtins_read_piped_input(self):
+        _, output, _ = self.run_command("TYPE fruit.txt | GREP apple")
+        self.assertIn("apple", output)
+
+    def test_a_pipeline_of_three_builtins(self):
+        _, output, _ = self.run_command("TYPE fruit.txt | SORT --unique | GREP a")
+        self.assertEqual(output.splitlines(), ["Apple", "apple", "banana"])
+
+    def test_dir_can_be_filtered_through_grep(self):
+        _, output, _ = self.run_command("DIR | GREP fruit")
+        self.assertIn("fruit.txt", output)
+
+    def test_piped_text_can_be_redirected_to_a_file(self):
+        self.run_command("TYPE fruit.txt | SORT --unique > sorted.txt")
+        self.assertEqual(
+            (self.root / "sorted.txt").read_text(encoding="utf-8").splitlines(),
+            ["Apple", "apple", "banana", "cherry"],
+        )
+
+
+class VariableTests(EmulatorTestCase):
+    def setUp(self):
+        super().setUp()
+        self.saved_environment = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved_environment)
+        super().tearDown()
+
+    def test_set_and_expand(self):
+        self.run_command("SET GREETING=hello")
+        _, output, _ = self.run_command("ECHO $GREETING world")
+        self.assertIn("hello world", output)
+
+    def test_braced_form(self):
+        self.run_command("SET NAME=pycmd")
+        _, output, _ = self.run_command("ECHO ${NAME}4")
+        self.assertIn("pycmd4", output)
+
+    def test_status_variable(self):
+        self.run_command("ECHO fine")
+        _, output, _ = self.run_command("ECHO $?")
+        self.assertIn("0", output)
+        self.run_command("JUMP nowhere")
+        _, output, _ = self.run_command("ECHO $?")
+        self.assertIn("1", output)
+
+    def test_unknown_names_are_left_literal(self):
+        _, output, _ = self.run_command("ECHO cost is $500 and $NOPE")
+        self.assertIn("$500", output)
+        self.assertIn("$NOPE", output)
+
+    def test_variables_reach_child_processes(self):
+        self.run_command("SET PYCMD_TEST_TOKEN=visible")
+        self.assertEqual(os.environ.get("PYCMD_TEST_TOKEN"), "visible")
+
+    def test_unset_removes_from_the_environment(self):
+        self.run_command("SET PYCMD_TEST_TOKEN=visible")
+        self.run_command("UNSET PYCMD_TEST_TOKEN")
+        self.assertNotIn("PYCMD_TEST_TOKEN", os.environ)
+        self.assertFalse(self.run_command("UNSET PYCMD_TEST_TOKEN")[0])
+
+    def test_a_variable_cannot_inject_a_command(self):
+        """Expansion happens after parsing, so contents are always data."""
+        os.chdir(self.root)
+        victim = self.root / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        self.run_command('SET EVIL="; DEL --force victim.txt"')
+        _, output, _ = self.run_command("ECHO $EVIL")
+        self.assertIn("; DEL --force victim.txt", output)
+        self.assertTrue(victim.exists(), "the variable was executed as a command")
+
+    def test_a_variable_can_name_a_redirection_target(self):
+        os.chdir(self.root)
+        self.run_command("SET OUT=via-var.txt")
+        self.run_command("ECHO written > $OUT")
+        self.assertEqual((self.root / "via-var.txt").read_text(encoding="utf-8"), "written\n")
+
+    def test_expansion_can_be_switched_off(self):
+        self.run_command("SET NAME=pycmd")
+        self.emulator.policy["expand_variables"] = False
+        _, output, _ = self.run_command("ECHO $NAME")
+        self.assertIn("$NAME", output)
+
+    def test_set_rejects_an_invalid_name(self):
+        self.assertFalse(self.run_command("SET bad-name=x")[0])
+
+    def test_env_filters(self):
+        self.run_command("SET PYCMD_TEST_TOKEN=visible")
+        _, output, _ = self.run_command("ENV PYCMD_TEST")
+        self.assertIn("PYCMD_TEST_TOKEN", output)
+        self.assertIn("session", output)
+
+
 class CommandLineTests(unittest.TestCase):
     """End-to-end coverage of main(), which nothing exercised before 4.0."""
 

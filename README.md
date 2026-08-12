@@ -23,13 +23,19 @@ EXPLAIN <line>            show exactly how PyCMD will interpret a line
 
 ## Features
 
-- **Builtins**: `CWD`/`CD`, `PWD`, `DIR`, `TREE`, `MKDIR`, `DEL`, `ECHO`, `CLS`,
-  `COLOR`, `TIME`, `DATE`, `WHICH`, `SHELL`.
+- **Files**: `DIR`, `TREE`, `MKDIR`, `RMDIR`, `DEL`, `COPY`, `MOVE`, `RENAME`,
+  `TOUCH`, plus `CWD`/`CD`, `PWD`, `WHICH`. Wildcards are expanded by PyCMD
+  itself, and anything destructive asks before acting on more than one file.
+- **Text tools**: `TYPE`, `GREP`, `SORT`, `HEAD`, `TAIL`, `COUNT`. They read a
+  file *or* piped input, so a whole pipeline can run without a single external
+  program: `TYPE notes.txt | SORT --unique | GREP todo`.
+- **Variables**: `SET`, `UNSET`, `ENV`, with `$NAME`, `${NAME}` and `$?`
+  (the last exit status). Variables are exported, so child processes see them.
 - **Operators**: chain commands with `&&` (on success), `||` (on failure) and
   `;` (always). A single `&` stays literal, so `DEL A&B.txt` still works.
-- **Redirection for builtins**: `>`, `>>`, `2>` and `<` work on PyCMD's own
-  commands, not just external programs — `DIR --details > listing.txt`.
-- **Pipes**: send builtin output into a real program, e.g.
+- **Redirection**: `>`, `>>`, `2>`, `2>&1` and `<` work on PyCMD's own commands
+  as well as external programs — `DIR --details > listing.txt`.
+- **Pipes**: between builtins, or into a real program —
   `DIR --details | findstr .py`.
 - **Execution policy**: an unrecognised command is *not* silently handed to
   `cmd.exe` (see below).
@@ -74,6 +80,7 @@ Inspect and change the policy with `POLICY`:
 |---|---|---|
 | `shell_fallback` | `confirm` | What happens to an unknown word: `off`, `confirm`, or `always` (the 3.0 behaviour). |
 | `path_programs` | `on` | Run words that resolve on PATH directly via `argv`. |
+| `expand_variables` | `on` | Expand `$NAME`, `${NAME}` and `$?`. |
 | `legacy` | `on` | Allow `LEGACY` and `!`. |
 | `run_shell` | `on` | Allow `RUN`'s shell mode (`RUN --safe` is unaffected). |
 | `operators` | `on` | Parse `&&`, `\|\|`, `;`, `\|` and redirection. Turn off for 3.0 line handling. |
@@ -103,6 +110,13 @@ BOOKMARK project C:\Users\kai99\Downloads\PyCMD
 JUMP project
 HISTORY search python
 DEL --dry-run *.tmp
+COPY *.py backup
+RMDIR --recurse build
+TYPE notes.txt | GREP --invert done | SORT > todo.txt
+DIR | COUNT
+SET EDITOR=code
+ECHO using $EDITOR
+GREP -n TODO *.py || ECHO nothing left to do
 RUN --safe python --version
 !echo shell shortcut
 EXPLAIN ll | findstr py
@@ -155,8 +169,14 @@ Besides the execution policy above:
 ## Notes and limitations
 
 - Redirected output is written as UTF-8, not the console code page.
-- Builtins do not read piped input or `<` redirection; a pipe feeds the next
-  *program*, so `DIR | findstr x` works and `DIR | ECHO x` discards the input.
+- Only the text tools (`TYPE`, `GREP`, `SORT`, `HEAD`, `TAIL`, `COUNT`) read
+  piped input. Piping into any other builtin discards it.
+- `SORT`, `TYPE`, `COPY`, `MOVE` and friends are PyCMD builtins, so they take
+  precedence over the Windows programs of the same name. Use `!sort` or
+  `RUN sort` when you specifically want the system one.
+- Variables expand as `$NAME`, not `%NAME%`, and expansion happens *after* the
+  line is parsed — so a variable holding `; DEL x` is text, never a command.
+  An unknown name is left as typed rather than blanked.
 - `!`, `LEGACY` and `RUN` pass their tail to the OS shell verbatim, so
   operators and redirection in those lines are the shell's to interpret, not
   PyCMD's. `ALIAS`, `MACRO` and `EXPLAIN` likewise keep their tail intact.
